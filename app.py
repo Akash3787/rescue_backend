@@ -1,38 +1,46 @@
-# app.py (with simple API key protection)
-import os
-import uuid
-from io import BytesIO
-from datetime import datetime
-
 from flask import Flask, request, jsonify, send_file
 from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
+from datetime import datetime
+from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+import uuid
+import os
+import logging
 
-# -------------------------
-# CONFIG
-# -------------------------
+# -----------------------------------------------------
+# APP INIT
+# -----------------------------------------------------
 app = Flask(__name__)
-CORS(app)
+logger = logging.getLogger(__name__)
 
-# Database URL from env (Railway will provide)
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "mysql+pymysql://flask_user:strongpassword@localhost/flask_app"
-)
-app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+# -----------------------------------------------------
+# DATABASE CONFIG (Railway uses DATABASE_URL)
+# -----------------------------------------------------
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if not DATABASE_URL:
+    logger.warning("DATABASE_URL NOT FOUND. Using local SQLite fallback.")
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///local_dev.db"
+else:
+    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# API key for writes (set in Railway env vars). If empty -> writes allowed (dev only)
-WRITE_API_KEY = os.environ.get("WRITE_API_KEY", "").strip()
 
 db = SQLAlchemy(app)
 
+# -----------------------------------------------------
+# API KEY FOR SECURITY
+# -----------------------------------------------------
+WRITE_API_KEY = os.environ.get("WRITE_API_KEY", "secret")
 
-# -------------------------
-# MODEL
-# -------------------------
+def require_key(req):
+    key = req.headers.get("x-api-key")
+    return key == WRITE_API_KEY
+
+# -----------------------------------------------------
+# DATABASE MODEL
+# -----------------------------------------------------
 class VictimReading(db.Model):
     __tablename__ = "victim_readings"
 
@@ -41,7 +49,7 @@ class VictimReading(db.Model):
     distance_cm = db.Column(db.Float, nullable=False)
     latitude = db.Column(db.Float)
     longitude = db.Column(db.Float)
-    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self):
         return {
@@ -53,85 +61,53 @@ class VictimReading(db.Model):
             "timestamp": self.timestamp.isoformat() + "Z",
         }
 
-
-# -------------------------
-# HELPERS
-# -------------------------
-def _check_api_key():
-    """Return True if request has correct API key or no key is required (dev)."""
-    if not WRITE_API_KEY:
-        return True  # dev mode: no key set
-    # First check header
-    header_key = request.headers.get("x-api-key")
-    if header_key and header_key == WRITE_API_KEY:
-        return True
-    # fallback: query param
-    q = request.args.get("api_key")
-    if q and q == WRITE_API_KEY:
-        return True
-    return False
-
-
-# -------------------------
+# -----------------------------------------------------
 # ROUTES
-# -------------------------
+# -----------------------------------------------------
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "msg": "Rescue backend online."})
+    return jsonify({"status": "ok", "msg": "Rescue backend online."}), 200
 
 
-# --- temporary debug wrapper for /api/v1/readings ---
-import traceback
-import logging
-
-logger = logging.getLogger(__name__)
-
+# Create a reading
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
-    try:
-        # AUTH
-        if not _check_api_key():
-            return jsonify({"error": "Unauthorized - invalid or missing API key"}), 401
+    if not require_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
 
-        data = request.get_json() or {}
-        distance_cm = data.get("distance_cm")
-        if distance_cm is None:
-            return jsonify({"error": "distance_cm is required"}), 400
+    data = request.get_json() or {}
 
-        victim_id = data.get("victim_id")
-        if victim_id is None:
-            victim_id = "vic-" + uuid.uuid4().hex[:8]
+    distance_cm = data.get("distance_cm")
+    if distance_cm is None:
+        return jsonify({"error": "distance_cm required"}), 400
 
-        reading = VictimReading(
-            victim_id=victim_id,
-            distance_cm=float(distance_cm),
-            latitude=data.get("latitude"),
-            longitude=data.get("longitude"),
-        )
-        db.session.add(reading)
-        db.session.commit()
+    victim_id = data.get("victim_id") or ("vic-" + uuid.uuid4().hex[:8])
 
-        return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
+    reading = VictimReading(
+        victim_id=victim_id,
+        distance_cm=float(distance_cm),
+        latitude=data.get("latitude"),
+        longitude=data.get("longitude"),
+    )
 
-    except Exception as e:
-        # Log full traceback to server logs (Railway)
-        tb = traceback.format_exc()
-        logger.error("create_reading error: %s\n%s", str(e), tb)
+    db.session.add(reading)
+    db.session.commit()
 
-        # Return error + traceback in JSON so you can see it via curl
-        return jsonify({
-            "error": "Internal server error (debug). See 'trace' for details.",
-            "message": str(e),
-            "trace": tb.splitlines()[-30:]  # last ~30 lines
-        }), 500
+    return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
 
 
+# Get all readings
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
-    readings = VictimReading.query.order_by(VictimReading.timestamp.desc()).all()
+    readings = (
+        VictimReading.query
+        .order_by(VictimReading.timestamp.desc())
+        .all()
+    )
     return jsonify([r.to_dict() for r in readings]), 200
 
 
+# Latest reading for victim
 @app.route("/api/v1/victims/<victim_id>/latest", methods=["GET"])
 def latest_reading(victim_id):
     reading = (
@@ -140,29 +116,38 @@ def latest_reading(victim_id):
         .order_by(VictimReading.timestamp.desc())
         .first()
     )
-    if reading is None:
-        return jsonify({"error": "No readings found for this victim_id"}), 404
+
+    if not reading:
+        return jsonify({"error": "No readings for this victim"}), 404
+
     return jsonify(reading.to_dict()), 200
 
 
+# Export PDF
 @app.route("/api/v1/readings/export/pdf", methods=["GET"])
 def export_readings_pdf():
-    readings = VictimReading.query.order_by(VictimReading.timestamp.asc()).all()
+    readings = (
+        VictimReading.query
+        .order_by(VictimReading.timestamp.asc())
+        .all()
+    )
+
     buffer = BytesIO()
     p = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
+    # Title
     p.setFont("Helvetica-Bold", 16)
     p.drawString(50, height - 50, "Rescue Radar - Victim Readings Export")
 
+    # Table header
     y = height - 90
     p.setFont("Helvetica-Bold", 10)
-    p.drawString(50, y, "ID")
-    p.drawString(90, y, "Victim ID")
-    p.drawString(220, y, "Distance (cm)")
-    p.drawString(320, y, "Lat")
-    p.drawString(380, y, "Lon")
-    p.drawString(450, y, "Timestamp")
+    headers = ["ID", "Victim", "Distance(cm)", "Lat", "Lon", "Time"]
+    x_positions = [50, 100, 200, 300, 360, 420]
+
+    for i, h in enumerate(headers):
+        p.drawString(x_positions[i], y, h)
 
     y -= 20
     p.setFont("Helvetica", 9)
@@ -173,24 +158,35 @@ def export_readings_pdf():
             y = height - 60
             p.setFont("Helvetica", 9)
 
-        p.drawString(50, y, str(r.id))
-        p.drawString(90, y, (r.victim_id or "")[:12])
-        p.drawString(220, y, f"{r.distance_cm:.2f}")
-        p.drawString(320, y, f"{r.latitude or 0:.4f}")
-        p.drawString(380, y, f"{r.longitude or 0:.4f}")
-        p.drawString(450, y, r.timestamp.strftime("%Y-%m-%d %H:%M:%S"))
+        values = [
+            str(r.id),
+            r.victim_id[:12],
+            f"{r.distance_cm:.2f}",
+            f"{r.latitude or 0:.4f}",
+            f"{r.longitude or 0:.4f}",
+            r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+
+        for i, val in enumerate(values):
+            p.drawString(x_positions[i], y, val)
+
         y -= 16
 
     p.showPage()
     p.save()
+
     buffer.seek(0)
-    return send_file(buffer, as_attachment=True, download_name="victim_readings.pdf", mimetype="application/pdf")
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name="victim_readings.pdf",
+        mimetype="application/pdf",
+    )
 
-
-# -------------------------
-# START (local dev)
-# -------------------------
+# -----------------------------------------------------
+# START SERVER
+# -----------------------------------------------------
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5001)))
+    app.run(host="0.0.0.0", port=5001, debug=True)
