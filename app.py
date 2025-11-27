@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # DATABASE CONFIG (Railway uses DATABASE_URL)
 # -----------------------------------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
+print(">>> STARTUP: DATABASE_URL =", DATABASE_URL)
 
 if not DATABASE_URL:
     logger.warning("DATABASE_URL NOT FOUND. Using local SQLite fallback.")
