@@ -28,6 +28,9 @@ else:
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
+# Ensure tables exist when worker imports app (Gunicorn / Railway)
+with app.app_context():
+    db.create_all()
 
 # -----------------------------------------------------
 # API KEY FOR SECURITY
