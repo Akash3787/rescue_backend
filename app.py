@@ -80,31 +80,50 @@ def home():
     return jsonify({"status": "ok", "msg": "Rescue backend online."})
 
 
+# --- temporary debug wrapper for /api/v1/readings ---
+import traceback
+import logging
+
+logger = logging.getLogger(__name__)
+
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
-    # AUTH
-    if not _check_api_key():
-        return jsonify({"error": "Unauthorized - invalid or missing API key"}), 401
+    try:
+        # AUTH
+        if not _check_api_key():
+            return jsonify({"error": "Unauthorized - invalid or missing API key"}), 401
 
-    data = request.get_json() or {}
-    distance_cm = data.get("distance_cm")
-    if distance_cm is None:
-        return jsonify({"error": "distance_cm is required"}), 400
+        data = request.get_json() or {}
+        distance_cm = data.get("distance_cm")
+        if distance_cm is None:
+            return jsonify({"error": "distance_cm is required"}), 400
 
-    victim_id = data.get("victim_id")
-    if victim_id is None:
-        victim_id = "vic-" + uuid.uuid4().hex[:8]
+        victim_id = data.get("victim_id")
+        if victim_id is None:
+            victim_id = "vic-" + uuid.uuid4().hex[:8]
 
-    reading = VictimReading(
-        victim_id=victim_id,
-        distance_cm=float(distance_cm),
-        latitude=data.get("latitude"),
-        longitude=data.get("longitude"),
-    )
-    db.session.add(reading)
-    db.session.commit()
+        reading = VictimReading(
+            victim_id=victim_id,
+            distance_cm=float(distance_cm),
+            latitude=data.get("latitude"),
+            longitude=data.get("longitude"),
+        )
+        db.session.add(reading)
+        db.session.commit()
 
-    return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
+        return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
+
+    except Exception as e:
+        # Log full traceback to server logs (Railway)
+        tb = traceback.format_exc()
+        logger.error("create_reading error: %s\n%s", str(e), tb)
+
+        # Return error + traceback in JSON so you can see it via curl
+        return jsonify({
+            "error": "Internal server error (debug). See 'trace' for details.",
+            "message": str(e),
+            "trace": tb.splitlines()[-30:]  # last ~30 lines
+        }), 500
 
 
 @app.route("/api/v1/readings/all", methods=["GET"])
