@@ -59,16 +59,22 @@ class VictimReading(db.Model):
     distance_cm = db.Column(db.Float, nullable=False)
     latitude = db.Column(db.Float)
     longitude = db.Column(db.Float)
+    # store timezone-aware timestamps (we'll set UTC on insert)
     timestamp = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
     def to_dict(self):
+        ts = self.timestamp
+        if isinstance(ts, datetime):
+            ts_iso = ts.astimezone(timezone.utc).isoformat()
+        else:
+            ts_iso = str(ts)
         return {
             "id": self.id,
             "victim_id": self.victim_id,
             "distance_cm": self.distance_cm,
             "latitude": self.latitude,
             "longitude": self.longitude,
-            "timestamp": (self.timestamp.astimezone(timezone.utc).isoformat() if isinstance(self.timestamp, datetime) else str(self.timestamp)) + "Z",
+            "timestamp": ts_iso + "Z",
         }
 
 # -------------------------
@@ -94,8 +100,6 @@ def admin_init_db():
 # -------------
 # CREATE / DEDUPE
 # -------------
-# Replace previous insert behaviour with debounce/dedupe logic.
-# Server will update last row or insert a new one based on thresholds.
 THRESHOLD_CM = float(os.environ.get("THRESHOLD_CM", "2.0"))   # min change to create new row
 MAX_INTERVAL_S = int(os.environ.get("MAX_INTERVAL_S", "10"))  # force new row after this many seconds
 
@@ -106,7 +110,6 @@ def create_reading():
 
     data = request.get_json() or {}
     try:
-        # Ensure numeric distance (expected in cm).
         distance_cm = float(data.get("distance_cm"))
     except (TypeError, ValueError):
         return jsonify({"error": "distance_cm required and must be numeric"}), 400
@@ -115,7 +118,6 @@ def create_reading():
     latitude = data.get("latitude")
     longitude = data.get("longitude")
 
-    # get latest reading for this victim
     last = (
         VictimReading.query
         .filter_by(victim_id=victim_id)
@@ -126,7 +128,6 @@ def create_reading():
     now = datetime.now(timezone.utc)
 
     if last is None:
-        # first time -> insert
         reading = VictimReading(
             victim_id=victim_id,
             distance_cm=distance_cm,
@@ -138,17 +139,29 @@ def create_reading():
         db.session.commit()
         return jsonify({"status": "created", "reading": reading.to_dict()}), 201
 
-    # compute delta and time difference
+    # --- Normalize last.timestamp to aware UTC datetime ---
+    last_ts = last.timestamp
     try:
-        last_ts = last.timestamp if isinstance(last.timestamp, datetime) else datetime.fromisoformat(str(last.timestamp))
+        # if it's a string, try parse; otherwise rely on datetime
+        if isinstance(last_ts, str):
+            last_ts = datetime.fromisoformat(last_ts)
     except Exception:
-        last_ts = last.timestamp if isinstance(last.timestamp, datetime) else now
+        # fallback: treat as now - small delta (avoid crash)
+        last_ts = now
 
-    dt = (now - last_ts).total_seconds()
+    # If last_ts is naive, assume UTC and attach timezone
+    if isinstance(last_ts, datetime) and last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+    # Now compute dt safely
+    try:
+        dt = (now - last_ts).total_seconds()
+    except Exception:
+        dt = MAX_INTERVAL_S + 1  # force insert on error
+
     delta_cm = abs(distance_cm - float(last.distance_cm or 0.0))
 
     if delta_cm >= THRESHOLD_CM or dt >= MAX_INTERVAL_S:
-        # meaningful change or forced by time window -> insert
         reading = VictimReading(
             victim_id=victim_id,
             distance_cm=distance_cm,
@@ -160,7 +173,6 @@ def create_reading():
         db.session.commit()
         return jsonify({"status": "created", "reading": reading.to_dict()}), 201
     else:
-        # small/no change -> update last row (prevents DB spam)
         last.distance_cm = distance_cm
         last.latitude = latitude
         last.longitude = longitude
@@ -255,7 +267,6 @@ def export_readings_pdf():
 # Start server when run locally
 # -------------------------
 if __name__ == "__main__":
-    # helpful info on startup
     logger.info("Starting local Flask dev server on 0.0.0.0:5001 (debug mode).")
     with app.app_context():
         db.create_all()
