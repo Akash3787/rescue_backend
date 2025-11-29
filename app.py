@@ -9,6 +9,12 @@ import uuid
 import os
 import logging
 
+from datetime import datetime, timezone, timedelta
+
+# dedupe / update policy
+DISTANCE_TOLERANCE_CM = 2.0    # treat changes <= 2 cm as the same reading
+TIME_WINDOW_SEC = 30           # within 30 seconds - update existing instead of insert
+
 # -------------------------
 # App + logging
 # -------------------------
@@ -108,77 +114,76 @@ def create_reading():
     if not require_key(request):
         return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.get_json() or {}
-    try:
-        distance_cm = float(data.get("distance_cm"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "distance_cm required and must be numeric"}), 400
+    data = request.get_json(silent=True) or {}
+
+    # accept either distance_cm or distance_m (convert meters -> cm)
+    if "distance_cm" in data:
+        try:
+            distance_cm = float(data.get("distance_cm"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "distance_cm must be numeric"}), 400
+    elif "distance_m" in data:
+        try:
+            distance_cm = float(data.get("distance_m")) * 100.0
+        except (TypeError, ValueError):
+            return jsonify({"error": "distance_m must be numeric"}), 400
+    else:
+        return jsonify({"error": "distance_cm or distance_m required"}), 400
 
     victim_id = data.get("victim_id") or ("vic-" + uuid.uuid4().hex[:8])
-    latitude = data.get("latitude")
-    longitude = data.get("longitude")
+    lat = data.get("latitude")
+    lon = data.get("longitude")
 
-    last = (
-        VictimReading.query
-        .filter_by(victim_id=victim_id)
-        .order_by(VictimReading.timestamp.desc())
-        .first()
-    )
+    try:
+        # Get the latest reading for this victim id (if any)
+        last = (
+            VictimReading.query
+            .filter_by(victim_id=victim_id)
+            .order_by(VictimReading.timestamp.desc())
+            .first()
+        )
 
-    now = datetime.now(timezone.utc)
+        # current time (naive UTC to match SQLAlchemy default if you used datetime.utcnow)
+        now = datetime.utcnow()
 
-    if last is None:
-        reading = VictimReading(
+        if last:
+            last_ts = last.timestamp
+            # normalize timezone-aware timestamps to naive UTC for safe subtraction
+            if getattr(last_ts, "tzinfo", None) is not None:
+                last_ts = last_ts.astimezone(timezone.utc).replace(tzinfo=None)
+
+            dt = (now - last_ts).total_seconds()
+            diff = abs(distance_cm - (last.distance_cm or 0.0))
+
+            # if change is small and within short time window => update (no duplicate)
+            if diff <= DISTANCE_TOLERANCE_CM and dt <= TIME_WINDOW_SEC:
+                # update only timestamp and GPS if newly provided (optional)
+                last.timestamp = now
+                if lat is not None:
+                    last.latitude = lat
+                if lon is not None:
+                    last.longitude = lon
+                # optionally update distance to newest reading (comment/uncomment as you prefer)
+                # last.distance_cm = distance_cm
+
+                db.session.commit()
+                return jsonify({"status": "ok", "action": "updated_existing", "reading": last.to_dict()}), 200
+
+        # otherwise insert a new reading
+        new_reading = VictimReading(
             victim_id=victim_id,
             distance_cm=distance_cm,
-            latitude=latitude,
-            longitude=longitude,
+            latitude=lat,
+            longitude=lon,
             timestamp=now
         )
-        db.session.add(reading)
+        db.session.add(new_reading)
         db.session.commit()
-        return jsonify({"status": "created", "reading": reading.to_dict()}), 201
+        return jsonify({"status": "ok", "action": "inserted_new", "reading": new_reading.to_dict()}), 201
 
-    # --- Normalize last.timestamp to aware UTC datetime ---
-    last_ts = last.timestamp
-    try:
-        # if it's a string, try parse; otherwise rely on datetime
-        if isinstance(last_ts, str):
-            last_ts = datetime.fromisoformat(last_ts)
-    except Exception:
-        # fallback: treat as now - small delta (avoid crash)
-        last_ts = now
-
-    # If last_ts is naive, assume UTC and attach timezone
-    if isinstance(last_ts, datetime) and last_ts.tzinfo is None:
-        last_ts = last_ts.replace(tzinfo=timezone.utc)
-
-    # Now compute dt safely
-    try:
-        dt = (now - last_ts).total_seconds()
-    except Exception:
-        dt = MAX_INTERVAL_S + 1  # force insert on error
-
-    delta_cm = abs(distance_cm - float(last.distance_cm or 0.0))
-
-    if delta_cm >= THRESHOLD_CM or dt >= MAX_INTERVAL_S:
-        reading = VictimReading(
-            victim_id=victim_id,
-            distance_cm=distance_cm,
-            latitude=latitude,
-            longitude=longitude,
-            timestamp=now
-        )
-        db.session.add(reading)
-        db.session.commit()
-        return jsonify({"status": "created", "reading": reading.to_dict()}), 201
-    else:
-        last.distance_cm = distance_cm
-        last.latitude = latitude
-        last.longitude = longitude
-        last.timestamp = now
-        db.session.commit()
-        return jsonify({"status": "updated", "reading": last.to_dict()}), 200
+    except Exception as e:
+        logger.exception("Error creating reading: %s", e)
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 # Get all readings (newest first)
 @app.route("/api/v1/readings/all", methods=["GET"])
