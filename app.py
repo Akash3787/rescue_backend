@@ -1,4 +1,4 @@
-# app.py
+# app.py - non-blocking DB init & safer engine options
 from flask import Flask, request, jsonify, send_file
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timezone
@@ -8,23 +8,19 @@ from reportlab.pdfgen import canvas
 import uuid
 import os
 import logging
+import threading
+import time
 
-from datetime import datetime, timezone, timedelta
-
-# dedupe / update policy
-DISTANCE_TOLERANCE_CM = 2.0    # treat changes <= 2 cm as the same reading
-TIME_WINDOW_SEC = 30           # within 30 seconds - update existing instead of insert
-
-# -------------------------
-# App + logging
-# -------------------------
+# -----------------------------------------------------
+# APP INIT
+# -----------------------------------------------------
 app = Flask(__name__)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app")
 logging.basicConfig(level=logging.INFO)
 
-# -------------------------
-# Database config
-# -------------------------
+# -----------------------------------------------------
+# DATABASE CONFIG (Railway uses DATABASE_URL)
+# -----------------------------------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 logger.info("STARTUP: DATABASE_URL = %s", DATABASE_URL)
 
@@ -34,29 +30,32 @@ if not DATABASE_URL:
 else:
     app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 
+# Safer engine options to avoid long blocking connections (esp. for MySQL)
+engine_opts = {
+    "pool_pre_ping": True,
+    "pool_recycle": 280,
+}
+# add a short connect timeout for pymysql if using mysql
+if DATABASE_URL and DATABASE_URL.startswith("mysql"):
+    engine_opts["connect_args"] = {"connect_timeout": 5}
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_opts
+
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 db = SQLAlchemy(app)
 
-# Ensure tables exist when imported (works for gunicorn import-time)
-try:
-    with app.app_context():
-        db.create_all()
-        logger.info("db.create_all() executed at import time")
-except Exception as e:
-    logger.exception("Error running db.create_all() at import time: %s", e)
-
-# -------------------------
-# API key for write ops
-# -------------------------
+# -----------------------------------------------------
+# API KEY FOR SECURITY
+# -----------------------------------------------------
 WRITE_API_KEY = os.environ.get("WRITE_API_KEY", "secret")
 
 def require_key(req):
     key = req.headers.get("x-api-key")
     return key == WRITE_API_KEY
 
-# -------------------------
-# DB model
-# -------------------------
+# -----------------------------------------------------
+# DATABASE MODEL
+# -----------------------------------------------------
 class VictimReading(db.Model):
     __tablename__ = "victim_readings"
 
@@ -65,127 +64,91 @@ class VictimReading(db.Model):
     distance_cm = db.Column(db.Float, nullable=False)
     latitude = db.Column(db.Float)
     longitude = db.Column(db.Float)
-    # store timezone-aware timestamps (we'll set UTC on insert)
-    timestamp = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    # use naive UTC datetime everywhere to avoid tz mixups
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self):
+        # render timestamp as ISO in UTC with Z suffix
         ts = self.timestamp
         if isinstance(ts, datetime):
-            ts_iso = ts.astimezone(timezone.utc).isoformat()
+            s = ts.replace(tzinfo=None).isoformat() + "Z"
         else:
-            ts_iso = str(ts)
+            s = str(ts)
         return {
             "id": self.id,
             "victim_id": self.victim_id,
             "distance_cm": self.distance_cm,
             "latitude": self.latitude,
             "longitude": self.longitude,
-            "timestamp": ts_iso + "Z",
+            "timestamp": s,
         }
 
-# -------------------------
-# Routes
-# -------------------------
+# -----------------------------------------------------
+# ROUTES
+# -----------------------------------------------------
 @app.route("/")
 def home():
     return jsonify({"status": "ok", "msg": "Rescue backend online."}), 200
 
-# Admin endpoint to create tables manually (protected by API key)
-@app.route("/admin/init-db", methods=["POST"])
-def admin_init_db():
-    if not require_key(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    try:
-        with app.app_context():
-            db.create_all()
-        return jsonify({"status": "ok", "msg": "db.create_all() executed"}), 200
-    except Exception as e:
-        logger.exception("admin init-db failed: %s", e)
-        return jsonify({"error": "failed", "detail": str(e)}), 500
-
-# -------------
-# CREATE / DEDUPE
-# -------------
-THRESHOLD_CM = float(os.environ.get("THRESHOLD_CM", "2.0"))   # min change to create new row
-MAX_INTERVAL_S = int(os.environ.get("MAX_INTERVAL_S", "10"))  # force new row after this many seconds
-
+# Create a reading
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
     if not require_key(request):
         return jsonify({"error": "Unauthorized"}), 401
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json() or {}
 
-    # accept either distance_cm or distance_m (convert meters -> cm)
-    if "distance_cm" in data:
-        try:
-            distance_cm = float(data.get("distance_cm"))
-        except (TypeError, ValueError):
-            return jsonify({"error": "distance_cm must be numeric"}), 400
-    elif "distance_m" in data:
-        try:
-            distance_cm = float(data.get("distance_m")) * 100.0
-        except (TypeError, ValueError):
-            return jsonify({"error": "distance_m must be numeric"}), 400
-    else:
-        return jsonify({"error": "distance_cm or distance_m required"}), 400
+    distance_cm = data.get("distance_cm")
+    if distance_cm is None:
+        return jsonify({"error": "distance_cm required"}), 400
 
     victim_id = data.get("victim_id") or ("vic-" + uuid.uuid4().hex[:8])
-    lat = data.get("latitude")
-    lon = data.get("longitude")
 
+    # optional: prevent duplicate noise entries by comparing with last reading
     try:
-        # Get the latest reading for this victim id (if any)
+        now = datetime.utcnow()
         last = (
             VictimReading.query
             .filter_by(victim_id=victim_id)
             .order_by(VictimReading.timestamp.desc())
             .first()
         )
-
-        # current time (naive UTC to match SQLAlchemy default if you used datetime.utcnow)
-        now = datetime.utcnow()
-
+        save = True
         if last:
+            # compute seconds difference safely (both naive UTC)
             last_ts = last.timestamp
-            # normalize timezone-aware timestamps to naive UTC for safe subtraction
-            if getattr(last_ts, "tzinfo", None) is not None:
-                last_ts = last_ts.astimezone(timezone.utc).replace(tzinfo=None)
+            # last_ts should be naive UTC because we stored datetime.utcnow()
+            if isinstance(last_ts, datetime):
+                diff_seconds = (now - last_ts).total_seconds()
+                # If reading is identical and within short time window, skip saving.
+                if diff_seconds < 5 and abs(float(distance_cm) - float(last.distance_cm)) < 0.01:
+                    save = False
+    except Exception:
+        # In case of any DB error, fall back to saving the reading to avoid data loss.
+        logger.exception("Error while checking last reading; will save current reading.")
 
-            dt = (now - last_ts).total_seconds()
-            diff = abs(distance_cm - (last.distance_cm or 0.0))
+    if not save:
+        return jsonify({"status": "skipped", "reason": "duplicate/too-fast"}), 200
 
-            # if change is small and within short time window => update (no duplicate)
-            if diff <= DISTANCE_TOLERANCE_CM and dt <= TIME_WINDOW_SEC:
-                # update only timestamp and GPS if newly provided (optional)
-                last.timestamp = now
-                if lat is not None:
-                    last.latitude = lat
-                if lon is not None:
-                    last.longitude = lon
-                # optionally update distance to newest reading (comment/uncomment as you prefer)
-                # last.distance_cm = distance_cm
+    reading = VictimReading(
+        victim_id=victim_id,
+        distance_cm=float(distance_cm),
+        latitude=data.get("latitude"),
+        longitude=data.get("longitude"),
+        timestamp=datetime.utcnow(),
+    )
 
-                db.session.commit()
-                return jsonify({"status": "ok", "action": "updated_existing", "reading": last.to_dict()}), 200
-
-        # otherwise insert a new reading
-        new_reading = VictimReading(
-            victim_id=victim_id,
-            distance_cm=distance_cm,
-            latitude=lat,
-            longitude=lon,
-            timestamp=now
-        )
-        db.session.add(new_reading)
+    try:
+        db.session.add(reading)
         db.session.commit()
-        return jsonify({"status": "ok", "action": "inserted_new", "reading": new_reading.to_dict()}), 201
-
     except Exception as e:
-        logger.exception("Error creating reading: %s", e)
-        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+        logger.exception("DB commit failed")
+        db.session.rollback()
+        return jsonify({"error": "db_error", "detail": str(e)}), 500
 
-# Get all readings (newest first)
+    return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
+
+# Get all readings
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
     readings = (
@@ -195,7 +158,7 @@ def all_readings():
     )
     return jsonify([r.to_dict() for r in readings]), 200
 
-# Latest for a victim
+# Latest reading for victim
 @app.route("/api/v1/victims/<victim_id>/latest", methods=["GET"])
 def latest_reading(victim_id):
     reading = (
@@ -204,11 +167,13 @@ def latest_reading(victim_id):
         .order_by(VictimReading.timestamp.desc())
         .first()
     )
-    if reading is None:
+
+    if not reading:
         return jsonify({"error": "No readings for this victim"}), 404
+
     return jsonify(reading.to_dict()), 200
 
-# Export PDF of all readings (ascending by time)
+# Export PDF
 @app.route("/api/v1/readings/export/pdf", methods=["GET"])
 def export_readings_pdf():
     readings = (
@@ -245,11 +210,11 @@ def export_readings_pdf():
 
         values = [
             str(r.id),
-            (r.victim_id[:12] if r.victim_id else ""),
-            f"{r.distance_cm:.2f}",
-            f"{r.latitude or 0:.4f}",
-            f"{r.longitude or 0:.4f}",
-            (r.timestamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if isinstance(r.timestamp, datetime) else str(r.timestamp)),
+            (r.victim_id or "")[:12],
+            f"{(r.distance_cm or 0):.2f}",
+            f"{(r.latitude or 0):.4f}",
+            f"{(r.longitude or 0):.4f}",
+            r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
         ]
 
         for i, val in enumerate(values):
@@ -268,11 +233,58 @@ def export_readings_pdf():
         mimetype="application/pdf",
     )
 
-# -------------------------
-# Start server when run locally
-# -------------------------
+# Admin: trigger DB init manually (protected)
+@app.route("/admin/init-db", methods=["POST"])
+def admin_init_db():
+    if not require_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        with app.app_context():
+            db.create_all()
+        return jsonify({"status": "ok", "msg": "db.create_all() executed"}), 200
+    except Exception as e:
+        logger.exception("admin init failed")
+        return jsonify({"error": "db_init_failed", "detail": str(e)}), 500
+
+# -----------------------------------------------------
+# BACKGROUND DB INIT (non-blocking at import)
+# -----------------------------------------------------
+def _background_db_init(delay_seconds=1, retries=5, backoff=2):
+    """
+    Try creating tables in background with retries. This avoids blocking worker import.
+    """
+    def _worker():
+        time.sleep(delay_seconds)
+        attempt = 0
+        while attempt < retries:
+            attempt += 1
+            try:
+                logger.info("background_db_init: attempt %d", attempt)
+                with app.app_context():
+                    db.create_all()
+                logger.info("background_db_init: success")
+                return
+            except Exception as e:
+                logger.exception("background_db_init: failed (attempt %d): %s", attempt, e)
+                time.sleep(backoff * attempt)
+        logger.error("background_db_init: all attempts failed")
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+# ONLY start background init when running under real process (avoid when imported by test runners)
+if __name__ != "__main__":
+    # when Gunicorn imports the module, kick off background DB init
+    try:
+        _background_db_init(delay_seconds=1, retries=4, backoff=2)
+        logger.info("background DB init scheduled")
+    except Exception:
+        logger.exception("Failed to schedule background DB init")
+
+# -----------------------------------------------------
+# START SERVER (for local dev)
+# -----------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting local Flask dev server on 0.0.0.0:5001 (debug mode).")
     with app.app_context():
+        # local dev - create tables synchronously so local testing is quick
         db.create_all()
     app.run(host="0.0.0.0", port=5001, debug=True)
