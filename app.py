@@ -66,7 +66,7 @@ class VictimReading(db.Model):
     __tablename__ = "victim_readings"
 
     id = db.Column(db.Integer, primary_key=True)
-    victim_id = db.Column(db.String(64), nullable=False, index=True)
+    victim_id = db.Column(db.String(64), nullable=False, index=True, unique=True)  # UNIQUE!
     distance_cm = db.Column(db.Float, nullable=False)
     latitude = db.Column(db.Float)
     longitude = db.Column(db.Float)
@@ -103,7 +103,7 @@ def require_key(req):
 def home():
     return jsonify({"status": "ok", "msg": "Rescue backend online."}), 200
 
-# Create a reading
+# ✅ FIXED: UPSERT - EXACTLY 1 ROW PER VICTIM (no duplicates!)
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
     if not require_key(request):
@@ -124,52 +124,46 @@ def create_reading():
 
     victim_id = data.get("victim_id") or ("vic-" + uuid.uuid4().hex[:8])
 
-    # Optional: prevent duplicate noise entries
-    save = True
+    # ✅ UPSERT: Always 1 row per victim - UPDATE existing or INSERT new
     try:
-        now = datetime.utcnow()
-        last = (
-            VictimReading.query
-            .filter_by(victim_id=victim_id)
-            .order_by(VictimReading.timestamp.desc())
-            .first()
-        )
-        if last and last.timestamp:
-            diff_seconds = (now - last.timestamp).total_seconds()
-            if diff_seconds < 5 and abs(distance_cm - last.distance_cm) < 0.01:
-                save = False
-                logger.info("Skipped duplicate reading for %s (%.2fcm)", victim_id, distance_cm)
-    except SQLAlchemyError as e:
-        logger.warning("Error checking duplicate: %s. Saving anyway.", e)
+        # Find existing victim (or None)
+        reading = VictimReading.query.filter_by(victim_id=victim_id).first()
+        
+        if reading:
+            # UPDATE existing row with NEW values (NO DUPLICATES!)
+            reading.distance_cm = distance_cm
+            reading.latitude = data.get("latitude")
+            reading.longitude = data.get("longitude")
+            reading.timestamp = datetime.utcnow()  # Fresh timestamp
+            action = "UPDATED"
+        else:
+            # INSERT new victim
+            reading = VictimReading(
+                victim_id=victim_id,
+                distance_cm=distance_cm,
+                latitude=data.get("latitude"),
+                longitude=data.get("longitude"),
+                timestamp=datetime.utcnow(),
+            )
+            db.session.add(reading)
+            action = "CREATED"
 
-    if not save:
-        return jsonify({"status": "skipped", "reason": "duplicate/too-fast"}), 200
-
-    reading = VictimReading(
-        victim_id=victim_id,
-        distance_cm=distance_cm,
-        latitude=data.get("latitude"),
-        longitude=data.get("longitude"),
-        timestamp=datetime.utcnow(),
-    )
-
-    try:
-        db.session.add(reading)
         db.session.commit()
-        logger.info("Saved reading %s: %.2fcm", victim_id, distance_cm)
+        logger.info("%s victim %s: %.2fcm", action, victim_id, distance_cm)
+        return jsonify({"status": "ok", "action": action, "reading": reading.to_dict()}), 200
+        
     except SQLAlchemyError as e:
-        logger.exception("DB commit failed")
+        logger.exception("DB upsert failed")
         db.session.rollback()
         return jsonify({"error": "db_error", "detail": str(e)}), 500
 
-    return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
-
-# Get all readings (paginated)
+# Get all victims (1 per victim - paginated)
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
     page = request.args.get("page", 1, type=int)
     per_page = min(request.args.get("per_page", 50, type=int), 100)
     
+    # Query DISTINCT victims (latest only)
     readings = (
         VictimReading.query
         .order_by(VictimReading.timestamp.desc())
@@ -183,25 +177,47 @@ def all_readings():
         "pages": readings.pages
     }), 200
 
-# Latest reading for victim
+# Latest reading for victim (now same as single row)
 @app.route("/api/v1/victims/<victim_id>/latest", methods=["GET"])
 def latest_reading(victim_id):
-    reading = (
-        VictimReading.query
-        .filter_by(victim_id=victim_id)
-        .order_by(VictimReading.timestamp.desc())
-        .first()
-    )
+    reading = VictimReading.query.filter_by(victim_id=victim_id).first()
 
     if not reading:
         return jsonify({"error": "No readings for this victim"}), 404
 
     return jsonify(reading.to_dict()), 200
 
+# 🔧 CLEANUP: Remove old duplicate victims (run ONCE)
+@app.route("/admin/clean-duplicates", methods=["POST"])
+def clean_duplicates():
+    if not require_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        # Delete ALL duplicates, keep only 1 latest per victim_id
+        result = db.session.query(
+            VictimReading.victim_id,
+            db.func.max(VictimReading.timestamp).label('max_ts')
+        ).group_by(VictimReading.victim_id).subquery()
+        
+        # Keep only the latest entry per victim
+        latest_ids = db.session.query(result.c.max_ts).distinct().subquery()
+        deleted = VictimReading.query.filter(
+            ~VictimReading.timestamp.in_(db.session.query(latest_ids))
+        ).delete(synchronize_session=False)
+        
+        db.session.commit()
+        logger.info("Cleaned %d duplicate readings", deleted)
+        return jsonify({"status": "cleaned", "deleted": deleted}), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.exception("Cleanup failed")
+        return jsonify({"error": "cleanup_failed", "detail": str(e)}), 500
+
 # FIXED: Export PDF (SECURE + ROBUST)
 @app.route("/api/v1/readings/export/pdf", methods=["GET"])
 def export_readings_pdf():
-    if not require_key(request):  # CRITICAL SECURITY FIX
+    if not require_key(request):
         return jsonify({"error": "Unauthorized"}), 401
     
     # Optional date filtering
@@ -216,7 +232,7 @@ def export_readings_pdf():
         except ValueError:
             return jsonify({"error": "Invalid from date format (YYYY-MM-DD)"}), 400
     
-    readings = query.limit(5000).all()  # Prevent OOM
+    readings = query.limit(5000).all()
     
     if not readings:
         return jsonify({"error": "No readings found"}), 404
@@ -231,13 +247,13 @@ def export_readings_pdf():
     p.drawString(50, height - 50, "Rescue Radar - Victim Readings Export")
     p.setFont("Helvetica", 10)
     p.drawString(50, height - 75, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    p.drawString(50, height - 95, f"Total Readings: {len(readings)} | Unique Victims: {len(set(r.victim_id for r in readings))}")
+    p.drawString(50, height - 95, f"Total Victims: {len(readings)}")
 
-    # FIXED: Wider table columns
+    # Wider table columns
     y = height - 130
     p.setFont("Helvetica-Bold", 9)
     headers = ["ID", "Victim ID", "Distance(cm)", "Latitude", "Longitude", "UTC Time"]
-    x_positions = [50, 120, 220, 320, 390, 460]  # Wider spacing
+    x_positions = [50, 120, 220, 320, 390, 460]
 
     for i, h in enumerate(headers):
         p.drawString(x_positions[i], y, h)
@@ -245,35 +261,28 @@ def export_readings_pdf():
     y -= 20
     p.setFont("Helvetica", 8)
 
-    victim_count = {}
     for r in readings:
         if y < 80:
-            # Page footer
             p.setFont("Helvetica", 7)
-            p.drawString(50, 50, f"Page {page_num} | Victims: {len(victim_count)}")
+            p.drawString(50, 50, f"Page {page_num}")
             p.showPage()
             page_num += 1
             y = height - 60
-            # Re-draw headers
             p.setFont("Helvetica-Bold", 9)
             for i, h in enumerate(headers):
                 p.drawString(x_positions[i], y, h)
             y -= 20
             p.setFont("Helvetica", 8)
 
-        # FIXED: Proper null handling + full victim_id
         values = [
             str(r.id),
-            r.victim_id[:20],  # Truncate only if too long for page
+            r.victim_id[:20],
             f"{r.distance_cm:.1f}" if r.distance_cm is not None else "N/A",
             f"{r.latitude:.4f}" if r.latitude is not None else "N/A",
             f"{r.longitude:.4f}" if r.longitude is not None else "N/A",
-            # FIXED: Proper UTC formatting
             r.timestamp.strftime("%Y-%m-%d %H:%M") if r.timestamp else "N/A"
         ]
 
-        victim_count[r.victim_id] = victim_count.get(r.victim_id, 0) + 1
-        
         for i, val in enumerate(values):
             p.drawString(x_positions[i], y, val)
 
@@ -281,7 +290,7 @@ def export_readings_pdf():
 
     # Final page footer
     p.setFont("Helvetica", 7)
-    p.drawString(50, 50, f"Final Page {page_num} | Total Victims: {len(victim_count)}")
+    p.drawString(50, 50, f"Final Page {page_num}")
     p.showPage()
     p.save()
 
@@ -293,7 +302,7 @@ def export_readings_pdf():
         mimetype="application/pdf",
     )
 
-# Admin: trigger DB init manually (protected)
+# Admin endpoints
 @app.route("/admin/init-db", methods=["POST"])
 def admin_init_db():
     if not require_key(request):
@@ -307,10 +316,9 @@ def admin_init_db():
         return jsonify({"error": "db_init_failed", "detail": str(e)}), 500
 
 # -----------------------------------------------------
-# BACKGROUND DB INIT (IMPROVED - with proper context)
+# BACKGROUND DB INIT (IMPROVED)
 # -----------------------------------------------------
 def _background_db_init(delay_seconds=2, retries=5, backoff=2):
-    """Thread-safe background DB init with proper app context"""
     def _worker():
         time.sleep(delay_seconds)
         attempt = 0
@@ -330,7 +338,6 @@ def _background_db_init(delay_seconds=2, retries=5, backoff=2):
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
-# Start background init for production (Gunicorn/Railway)
 if __name__ != "__main__":
     try:
         _background_db_init()
