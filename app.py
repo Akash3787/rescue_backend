@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response  # Added Response
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS  # NEW: Flutter cross-origin access
 from datetime import datetime, timezone
 from io import BytesIO
 from reportlab.lib.pagesizes import A4
@@ -10,11 +11,15 @@ import logging
 import threading
 import time
 from sqlalchemy.exc import SQLAlchemyError
+import serial
+import serial.tools.list_ports
+import cv2  # NEW: USB Endoscope camera
 
 # -----------------------------------------------------
 # APP INIT
 # -----------------------------------------------------
 app = Flask(__name__)
+CORS(app)  # NEW: Enable Flutter dashboard access
 logger = logging.getLogger("app")
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +43,14 @@ WRITE_API_KEY = os.environ.get("WRITE_API_KEY")
 if not WRITE_API_KEY:
     raise ValueError("WRITE_API_KEY environment variable is required")
 
+# NEW: ESP32 Serial Configuration
+ESP_PORT = os.environ.get("ESP_PORT", "/dev/cu.usbserial-*")  # MacOS-friendly default
+BAUD_RATE = 115200
+esp_serial = None  # Global serial connection
+
+# NEW: USB Endoscope Camera (Global)
+cap = None
+
 # Safer engine options to avoid long blocking connections
 engine_opts = {
     "pool_pre_ping": True,
@@ -60,7 +73,81 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
 # -----------------------------------------------------
-# DATABASE MODEL (MOVED AFTER db INIT)
+# NEW: USB ENDOSCOPE FUNCTIONS
+# -----------------------------------------------------
+def init_camera():
+    """Initialize USB endoscope camera (device 1: HD camera)"""
+    global cap
+    try:
+        cap = cv2.VideoCapture(1)  # Your detected HD camera
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 15)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Zero latency
+        logger.info("✅ Endoscope camera initialized (640x480@15fps uyvy422)")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Camera init failed: {e}")
+        return False
+
+def gen_frames():
+    """MJPEG generator for Flutter dashboard"""
+    global cap
+    while cap and cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.1)
+            continue
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        frame_bytes = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
+        yield frame_bytes
+
+# -----------------------------------------------------
+# ESP32 SERIAL FUNCTIONS (UNCHANGED)
+# -----------------------------------------------------
+def connect_esp():
+    """Connect to ESP32 serial port"""
+    global esp_serial
+    if esp_serial and esp_serial.is_open:
+        return True
+    
+    try:
+        logger.info(f"🔌 Connecting to ESP32 on {ESP_PORT}")
+        esp_serial = serial.Serial(ESP_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2)  # ESP boot time
+        logger.info("✅ ESP32 connected on %s", ESP_PORT)
+        return True
+    except Exception as e:
+        logger.error("❌ ESP32 connection failed: %s on port %s", e, ESP_PORT)
+        return False
+
+def send_esp_command(cmd):
+    """Send command to ESP32"""
+    if not connect_esp():
+        logger.error("❌ ESP not connected - command '%s' failed", cmd)
+        return False
+    
+    try:
+        esp_serial.write(f"{cmd}\n".encode())
+        esp_serial.flush()
+        logger.info("📤 ESP CMD: %s", cmd)
+        time.sleep(0.1)  # Small delay for ESP processing
+        return True
+    except Exception as e:
+        logger.error("❌ ESP send failed: %s", e)
+        return False
+
+def find_esp_ports():
+    """Find available serial ports (DEBUG)"""
+    ports = serial.tools.list_ports.comports()
+    esp_ports = []
+    for port in ports:
+        if "esp" in port.description.lower() or "ch340" in port.description.lower() or "cp210" in port.description.lower():
+            esp_ports.append(port.device)
+    return esp_ports
+
+# -----------------------------------------------------
+# DATABASE MODEL (UNCHANGED)
 # -----------------------------------------------------
 class VictimReading(db.Model):
     __tablename__ = "victim_readings"
@@ -90,20 +177,69 @@ class VictimReading(db.Model):
         }
 
 # -----------------------------------------------------
-# API KEY FOR SECURITY
+# API KEY FOR SECURITY (UNCHANGED)
 # -----------------------------------------------------
 def require_key(req):
     key = req.headers.get("x-api-key")
     return key == WRITE_API_KEY
 
 # -----------------------------------------------------
-# ROUTES
+# ROUTES - YOUR ORIGINAL + NEW CAMERA ROUTES
 # -----------------------------------------------------
 @app.route("/")
 def home():
-    return jsonify({"status": "ok", "msg": "Rescue backend online."}), 200
+    esp_status = "✅ Connected" if connect_esp() else "❌ Disconnected"
+    camera_status = "✅ Live" if cap and cap.isOpened() else "❌ Offline"
+    if not cap:
+        init_camera()  # Auto-init camera
+    ports = find_esp_ports()
+    return jsonify({
+        "status": "ok",
+        "msg": "Rescue Radar Backend - LIVE CAMERA + RADAR",
+        "esp_status": esp_status,
+        "camera_status": camera_status,
+        "available_ports": ports,
+        "esp_port": ESP_PORT,
+        "camera_device": 1  # HD camera index
+    }), 200
 
-# ✅ FIXED: UPSERT - EXACTLY 1 ROW PER VICTIM (no duplicates!)
+# NEW: LIVE CAMERA STREAM (MJPEG for Flutter dashboard)
+@app.route('/stream')
+def video_feed():
+    """Live MJPEG stream - matches Flutter _mjpegUrl"""
+    global cap
+    if not cap or not cap.isOpened():
+        if not init_camera():
+            return "Camera unavailable", 500
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# NEW: SINGLE SNAPSHOT (Flutter fallback)
+@app.route('/snap')
+def snap():
+    """Single frame snapshot - matches Flutter _snapUrl"""
+    global cap
+    if not cap or not cap.isOpened():
+        if not init_camera():
+            return "Camera unavailable", 500
+    ret, frame = cap.read()
+    if ret:
+        ret, buffer = cv2.imencode('.jpg', frame)
+        return Response(buffer.tobytes(), mimetype='image/jpeg')
+    return "Camera read failed", 500
+
+# NEW: CAMERA STATUS API
+@app.route('/api/camera/status')
+def camera_status():
+    """Camera health check for Flutter"""
+    global cap
+    return jsonify({
+        "live": cap.isOpened() if cap else False,
+        "device": 1,
+        "resolution": "640x480@15fps",
+        "format": "uyvy422"
+    })
+
+# ✅ FIXED: UPSERT - EXACTLY 1 ROW PER VICTIM (YOUR ORIGINAL)
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
     if not require_key(request):
@@ -157,7 +293,37 @@ def create_reading():
         db.session.rollback()
         return jsonify({"error": "db_error", "detail": str(e)}), 500
 
-# Get all victims (1 per victim - paginated)
+# NEW: SOS BUTTON - Triggers BUZZER on ESP32 (YOUR CODE)
+@app.route("/send-sos", methods=["POST"])
+def send_sos():
+    logger.info("🚨 SOS BUTTON PRESSED FROM DASHBOARD!")
+    success = send_esp_command("SOS_ON")  # Send SOS command to ESP32
+    if success:
+        logger.info("✅ SOS command sent to ESP32 buzzer")
+    return jsonify({
+        "status": "sos_triggered",
+        "success": success,
+        "message": "Buzzer SOS pattern activated on ESP32" if success else "ESP connection failed"
+    }), 200
+
+# NEW: LIGHT TOGGLE - Controls LED on ESP32 (YOUR CODE)
+@app.route("/toggle-light", methods=["POST"])
+def toggle_light():
+    data = request.get_json() or {}
+    status = data.get("status", "OFF")
+    
+    cmd = "LIGHT_ON" if status.upper() == "ON" else "LIGHT_OFF"
+    success = send_esp_command(cmd)
+    
+    logger.info("💡 LIGHT TOGGLE: %s -> ESP32 CMD: %s", status, cmd)
+    return jsonify({
+        "status": "light_toggled",
+        "light_status": status,
+        "esp_command": cmd,
+        "success": success
+    }), 200
+
+# Get all victims (1 per victim - paginated) (YOUR CODE)
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
     page = request.args.get("page", 1, type=int)
@@ -177,7 +343,7 @@ def all_readings():
         "pages": readings.pages
     }), 200
 
-# Latest reading for victim (now same as single row)
+# Latest reading for victim (now same as single row) (YOUR CODE)
 @app.route("/api/v1/victims/<victim_id>/latest", methods=["GET"])
 def latest_reading(victim_id):
     reading = VictimReading.query.filter_by(victim_id=victim_id).first()
@@ -187,7 +353,7 @@ def latest_reading(victim_id):
 
     return jsonify(reading.to_dict()), 200
 
-# 🔧 CLEANUP: Remove old duplicate victims (run ONCE)
+# 🔧 CLEANUP: Remove old duplicate victims (YOUR CODE)
 @app.route("/admin/clean-duplicates", methods=["POST"])
 def clean_duplicates():
     if not require_key(request):
@@ -214,7 +380,7 @@ def clean_duplicates():
         logger.exception("Cleanup failed")
         return jsonify({"error": "cleanup_failed", "detail": str(e)}), 500
 
-# FIXED: Export PDF (SECURE + ROBUST)
+# FIXED: Export PDF (YOUR CODE)
 @app.route("/api/v1/readings/export/pdf", methods=["GET"])
 def export_readings_pdf():
     if not require_key(request):
@@ -302,7 +468,19 @@ def export_readings_pdf():
         mimetype="application/pdf",
     )
 
-# Admin endpoints
+# NEW: ESP32 Status/Debug endpoint (YOUR CODE)
+@app.route("/api/esp/status", methods=["GET"])
+def esp_status():
+    connected = connect_esp()
+    ports = find_esp_ports()
+    return jsonify({
+        "connected": connected,
+        "port": ESP_PORT,
+        "available_ports": ports,
+        "serial_open": esp_serial.is_open if esp_serial else False
+    }), 200
+
+# Admin endpoints (YOUR CODE)
 @app.route("/admin/init-db", methods=["POST"])
 def admin_init_db():
     if not require_key(request):
@@ -316,7 +494,7 @@ def admin_init_db():
         return jsonify({"error": "db_init_failed", "detail": str(e)}), 500
 
 # -----------------------------------------------------
-# BACKGROUND DB INIT (IMPROVED)
+# BACKGROUND DB INIT (IMPROVED) (YOUR CODE)
 # -----------------------------------------------------
 def _background_db_init(delay_seconds=2, retries=5, backoff=2):
     def _worker():
@@ -346,10 +524,14 @@ if __name__ != "__main__":
         logger.exception("Failed to schedule background DB init")
 
 # -----------------------------------------------------
-# START SERVER (for local dev)
+# START SERVER (MODIFIED: Auto-init camera)
 # -----------------------------------------------------
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-        logger.info("Local dev: Tables created")
-    app.run(host="0.0.0.0", port=5001, debug=True)
+        init_camera()  # NEW: Auto-initialize USB endoscope
+        logger.info("Local dev: Tables created + Camera initialized")
+        logger.info(f"ESP32 port set to: {ESP_PORT}")
+        logger.info("Available ESP ports: %s", find_esp_ports())
+    logger.info("🚀 RESCUE RADAR Server + LIVE CAMERA starting on http://0.0.0.0:5001")
+    app.run(host="0.0.0.0", port=5001, debug=True, threaded=True)
