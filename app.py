@@ -101,46 +101,67 @@ def init_camera():
     if not OPENCV_AVAILABLE:
         logger.info("Camera skipped (no OpenCV)")
         return False
+        
     try:
-        # Primary try device index 1 (adjust if needed)
-        cap = cv2.VideoCapture(1)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 15)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        ret, frame = cap.read()
-        if ret and frame is not None and frame.size > 0:
-            logger.info("✅ ENDOSCOPE LIVE: 640x480 uyvy422")
-            return True
-
-        logger.info("640x480 failed - fallback to 320x240")
-        try:
-            cap.release()
-        except:
-            pass
-
-        cap = cv2.VideoCapture(1)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        cap.set(cv2.CAP_PROP_FPS, 10)
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            logger.info("✅ ENDOSCOPE OK: 320x240 fallback")
-            return True
-
-        logger.warning("No camera found")
+        # Try indices 0, 1, 2 to find the endoscope
+        # Skip the built-in FaceTime camera
+        for device_idx in [0, 1, 2]:
+            try:
+                cap = cv2.VideoCapture(device_idx)
+            except Exception as e:
+                logger.debug(f"Failed to open device {device_idx}: {e}")
+                continue
+            
+            # Set UYVY422 format
+            try:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
+            except Exception:
+                # Some OpenCV builds may ignore FOURCC; ignore failure
+                pass
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 15)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                # not all backends support BUFFERSIZE
+                pass
+            
+            # Test if this camera works
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                # Check resolution read back
+                try:
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                except Exception:
+                    width, height = 0, 0
+                logger.info(f"✅ Camera at index {device_idx}: {width}x{height}")
+                
+                # If you want to skip FaceTime (usually 1280x720), uncomment:
+                # if width == 1280 and height == 720:
+                #     logger.info(f"Skipping FaceTime camera at index {device_idx}")
+                #     cap.release()
+                #     continue
+                
+                logger.info(f"✅ ENDOSCOPE LIVE: {width}x{height} uyvy422 (device {device_idx})")
+                return True
+            else:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                
+        logger.warning("No working camera found")
         return False
-
+        
     except Exception as e:
         logger.error(f"Camera error: {e}")
         return False
 
 def gen_frames():
     global cap
-    if not cap or not cap.isOpened():
+    if not cap or not getattr(cap, "isOpened", lambda: False)():
         return
     frame_count = 0
     while cap.isOpened():
