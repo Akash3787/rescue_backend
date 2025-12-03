@@ -22,12 +22,20 @@ if not hasattr(pkgutil, "get_loader"):
             return None
     pkgutil.get_loader = _compat_get_loader
 
+# core imports
 from flask import Flask, request, jsonify, send_file, Response, abort
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from sqlalchemy.exc import SQLAlchemyError
+
+# optional diagnostics
+try:
+    import faulthandler
+    faulthandler.enable()
+except Exception:
+    pass
 
 # Logging
 logger = logging.getLogger("app")
@@ -94,95 +102,152 @@ def _ensure_placeholder():
             logger.error("Failed to create placeholder image: %s", e)
 
 # -----------------------------------------------------
-# CAMERA (OpenCV) helpers
+# CAMERA (OpenCV) helpers - your robust version included
 # -----------------------------------------------------
 def init_camera():
     global cap
     if not OPENCV_AVAILABLE:
         logger.info("Camera skipped (no OpenCV)")
         return False
-        
+
+    # Release any existing camera first
+    if cap is not None:
+        try:
+            cap.release()
+        except:
+            pass
+        cap = None
+
     try:
         # Try indices 0, 1, 2 to find the endoscope
-        # Skip the built-in FaceTime camera
         for device_idx in [0, 1, 2]:
+            test_cap = None
             try:
-                cap = cv2.VideoCapture(device_idx)
-            except Exception as e:
-                logger.debug(f"Failed to open device {device_idx}: {e}")
-                continue
-            
-            # Set UYVY422 format
-            try:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
-            except Exception:
-                # Some OpenCV builds may ignore FOURCC; ignore failure
-                pass
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 15)
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                # not all backends support BUFFERSIZE
-                pass
-            
-            # Test if this camera works
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.size > 0:
-                # Check resolution read back
+                test_cap = cv2.VideoCapture(device_idx)
+                if not test_cap.isOpened():
+                    try:
+                        test_cap.release()
+                    except:
+                        pass
+                    continue
+
+                # Set UYVY422 format
+                test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
+                test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                test_cap.set(cv2.CAP_PROP_FPS, 15)
+                # not all platforms support BUFFERSIZE; guard it
                 try:
+                    test_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except:
+                    pass
+
+                # Test if this camera works
+                ret, frame = test_cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    cap = test_cap
                     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                except Exception:
-                    width, height = 0, 0
-                logger.info(f"✅ Camera at index {device_idx}: {width}x{height}")
-                
-                # If you want to skip FaceTime (usually 1280x720), uncomment:
-                # if width == 1280 and height == 720:
-                #     logger.info(f"Skipping FaceTime camera at index {device_idx}")
-                #     cap.release()
-                #     continue
-                
-                logger.info(f"✅ ENDOSCOPE LIVE: {width}x{height} uyvy422 (device {device_idx})")
-                return True
-            else:
+                    logger.info(f"✅ ENDOSCOPE LIVE: {width}x{height} uyvy422 (device {device_idx})")
+                    return True
+                else:
+                    try:
+                        test_cap.release()
+                    except:
+                        pass
+            except Exception as e:
+                logger.warning(f"Camera index {device_idx} failed: {e}")
                 try:
-                    cap.release()
-                except Exception:
+                    if test_cap is not None:
+                        test_cap.release()
+                except:
                     pass
-                
+                continue
+
         logger.warning("No working camera found")
         return False
-        
+
     except Exception as e:
-        logger.error(f"Camera error: {e}")
+        logger.error(f"Camera initialization error: {e}")
         return False
+
 
 def gen_frames():
     global cap
-    if not cap or not getattr(cap, "isOpened", lambda: False)():
-        return
     frame_count = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.1)
-            continue
+    consecutive_errors = 0
+    max_errors = 10
+
+    while True:
         try:
-            # convert if needed and encode as jpeg
-            if len(frame.shape) == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if ret:
-                frame_bytes = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
-                yield frame_bytes
-                frame_count += 1
-                if frame_count % 60 == 0:
-                    logger.info(f"Streaming {frame_count} frames...")
+            # Check if camera is still valid
+            if cap is None or not getattr(cap, "isOpened", lambda: False)():
+                logger.warning("Camera not available, reinitializing...")
+                if not init_camera():
+                    logger.error("Failed to reinitialize camera")
+                    time.sleep(1)
+                    continue
+
+            ret, frame = cap.read()
+
+            if not ret or frame is None:
+                consecutive_errors += 1
+                if consecutive_errors > max_errors:
+                    logger.error("Too many consecutive read failures, reinitializing camera")
+                    try:
+                        cap.release()
+                    except:
+                        pass
+                    cap = None
+                    if not init_camera():
+                        time.sleep(1)
+                        continue
+                    consecutive_errors = 0
+                else:
+                    time.sleep(0.1)
+                continue
+
+            consecutive_errors = 0  # Reset on success
+
+            try:
+                # Convert color space if needed
+                if len(frame.shape) == 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Encode to JPEG
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if ret:
+                    frame_bytes = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n'
+                    yield frame_bytes
+                    frame_count += 1
+                    if frame_count % 60 == 0:
+                        logger.info(f"Streaming {frame_count} frames...")
+                else:
+                    logger.warning("Failed to encode frame")
+                    time.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"Frame processing error: {e}")
+                time.sleep(0.1)
+                continue
+
         except Exception as e:
-            logger.debug("Frame encode error: %s", e)
-            time.sleep(0.1)
+            logger.error(f"Generator error: {e}")
+            consecutive_errors += 1
+            if consecutive_errors > max_errors:
+                logger.error("Too many errors, reinitializing camera")
+                try:
+                    if cap is not None:
+                        cap.release()
+                except:
+                    pass
+                cap = None
+                if not init_camera():
+                    time.sleep(1)
+                    continue
+                consecutive_errors = 0
+            else:
+                time.sleep(0.5)
 
 # -----------------------------------------------------
 # ESP32 (serial) helpers
@@ -394,7 +459,7 @@ def toggle_light():
         "light_status": status,
         "success": success
     }), 200
-    
+
 @app.route("/admin/clear-readings", methods=["POST"])
 def clear_readings():
     if not require_key(request):
@@ -406,7 +471,7 @@ def clear_readings():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-        
+
 
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
@@ -532,4 +597,5 @@ if __name__ == "__main__":
     logger.info(f"🔌 ESP32: {'✅ READY' if SERIAL_AVAILABLE else '❌ OFF'}")
     logger.info("=" * 50)
 
-    app.run(host="0.0.0.0", port=5001, debug=True, threaded=True)
+    # For local stability avoid the reloader when running with native libs
+    app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False, threaded=True)
