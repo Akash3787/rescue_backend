@@ -1,16 +1,37 @@
-from flask import Flask, request, jsonify, send_file, Response
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from datetime import datetime, timezone
-from io import BytesIO
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-import uuid
+# app.py - RESCUE RADAR backend (full edited)
+
+# Compatibility shim for older code expecting pkgutil.get_loader
+import pkgutil
+import importlib.util
 import os
+import base64
 import logging
 import threading
 import time
+import uuid
+from datetime import datetime
+from io import BytesIO
+
+# ensure get_loader exists (some Python installs remove it)
+if not hasattr(pkgutil, "get_loader"):
+    def _compat_get_loader(name):
+        try:
+            spec = importlib.util.find_spec(name)
+            return spec.loader if spec is not None else None
+        except Exception:
+            return None
+    pkgutil.get_loader = _compat_get_loader
+
+from flask import Flask, request, jsonify, send_file, Response, abort
+from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 from sqlalchemy.exc import SQLAlchemyError
+
+# Logging
+logger = logging.getLogger("app")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 # CLOUD-SAFE CONDITIONAL IMPORTS
 SERIAL_AVAILABLE = False
@@ -20,26 +41,22 @@ try:
     import serial
     import serial.tools.list_ports
     SERIAL_AVAILABLE = True
-except ImportError:
-    logging.warning("pyserial not available - ESP32 disabled")
+except Exception:
+    logger.warning("pyserial not available - ESP32 disabled")
 
 try:
     import cv2
     OPENCV_AVAILABLE = True
-except ImportError:
-    logging.warning("opencv-python not available - camera disabled")
+except Exception:
+    logger.warning("opencv-python not available - camera disabled")
 
 # GLOBALS
 esp_serial = None
 cap = None
 
-# -----------------------------------------------------
 # APP INIT
-# -----------------------------------------------------
 app = Flask(__name__)
 CORS(app)
-logger = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 # DATABASE
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -52,41 +69,58 @@ else:
 
 WRITE_API_KEY = os.environ.get("WRITE_API_KEY", "rescue-radar-dev")
 ESP_PORT = os.environ.get("ESP_PORT", "/dev/cu.usbserial-*")
-BAUD_RATE = 115200
+BAUD_RATE = int(os.environ.get("BAUD_RATE", 115200))
 
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
+# Ensure static folder exists for simulation
+STATIC_DIR = os.path.join(os.getcwd(), "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+# If CAMERA_SIMULATE=1 and placeholder missing, create one tiny jpeg
+PLACEHOLDER_PATH = os.path.join(STATIC_DIR, "snap.jpg")
+_PLACEHOLDER_BASE64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxISEhUTEhIVFRUVFRUVFRUVFRUVFRUVFRUWFhUVFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMtNygtLisBCgoKDg0OGxAQGy0lICYtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAKAAoAMBIgACEQEDEQH/xAAbAAACAwEBAQAAAAAAAAAAAAAEBQIDBgEHAP/EADQQAAIBAgQDBgQFBQAAAAAAAAECAwQRAAUSIRMxQWFxgZGh8AUiMqHB0fAUM2KSscH/xAAaAQACAwEBAAAAAAAAAAAAAAABAgADBAUG/8QALBEAAgIBAwMCBwAAAAAAAAAAAQIAEQMSITEEMkFRcQQiMlJhgaGx/9oADAMBAAIRAxEAPwD8qKqurq6urrq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6v/2Q=="
+)
+
+def _ensure_placeholder():
+    if not os.path.exists(PLACEHOLDER_PATH):
+        try:
+            with open(PLACEHOLDER_PATH, "wb") as f:
+                f.write(base64.b64decode(_PLACEHOLDER_BASE64))
+            logger.info("Created placeholder static/snap.jpg for CAMERA_SIMULATE")
+        except Exception as e:
+            logger.error("Failed to create placeholder image: %s", e)
+
 # -----------------------------------------------------
-# FIXED USB ENDOSCOPE (uyvy422 + fallbacks)
+# CAMERA (OpenCV) helpers
 # -----------------------------------------------------
 def init_camera():
     global cap
     if not OPENCV_AVAILABLE:
         logger.info("Camera skipped (no OpenCV)")
         return False
-        
     try:
-        # PRIMARY: Device 1 (your HD endoscope)
+        # Primary try device index 1 (adjust if needed)
         cap = cv2.VideoCapture(1)
-        
-        # UYVY422 PIXEL FORMAT FIX (from your ffplay)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 15)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        # CRITICAL: TEST FRAME
+
         ret, frame = cap.read()
         if ret and frame is not None and frame.size > 0:
             logger.info("✅ ENDOSCOPE LIVE: 640x480 uyvy422")
             return True
-            
-        logger.info("640x480 failed - fallback...")
-        cap.release()
-        
-        # FALLBACK: Lower res
+
+        logger.info("640x480 failed - fallback to 320x240")
+        try:
+            cap.release()
+        except:
+            pass
+
         cap = cv2.VideoCapture(1)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('U', 'Y', 'V', 'Y'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
@@ -96,10 +130,10 @@ def init_camera():
         if ret and frame is not None:
             logger.info("✅ ENDOSCOPE OK: 320x240 fallback")
             return True
-            
+
         logger.warning("No camera found")
         return False
-        
+
     except Exception as e:
         logger.error(f"Camera error: {e}")
         return False
@@ -108,15 +142,14 @@ def gen_frames():
     global cap
     if not cap or not cap.isOpened():
         return
-        
     frame_count = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret or frame is None:
             time.sleep(0.1)
             continue
-            
         try:
+            # convert if needed and encode as jpeg
             if len(frame.shape) == 3:
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -126,19 +159,20 @@ def gen_frames():
                 frame_count += 1
                 if frame_count % 60 == 0:
                     logger.info(f"Streaming {frame_count} frames...")
-        except:
+        except Exception as e:
+            logger.debug("Frame encode error: %s", e)
             time.sleep(0.1)
 
 # -----------------------------------------------------
-# ESP32 FUNCTIONS
+# ESP32 (serial) helpers
 # -----------------------------------------------------
 def connect_esp():
     if not SERIAL_AVAILABLE:
         return False
     global esp_serial
-    if esp_serial and esp_serial.is_open:
-        return True
     try:
+        if esp_serial and getattr(esp_serial, "is_open", False):
+            return True
         esp_serial = serial.Serial(ESP_PORT, BAUD_RATE, timeout=1)
         time.sleep(2)
         logger.info(f"ESP32 connected: {ESP_PORT}")
@@ -148,14 +182,17 @@ def connect_esp():
         return False
 
 def send_esp_command(cmd):
-    if not SERIAL_AVAILABLE or not connect_esp():
+    if not SERIAL_AVAILABLE:
+        return False
+    if not connect_esp():
         return False
     try:
         esp_serial.write(f"{cmd}\n".encode())
         esp_serial.flush()
         logger.info(f"ESP CMD: {cmd}")
         return True
-    except:
+    except Exception as e:
+        logger.error("Failed to send ESP command: %s", e)
         return False
 
 def find_esp_ports():
@@ -163,8 +200,8 @@ def find_esp_ports():
         return []
     try:
         ports = serial.tools.list_ports.comports()
-        return [p.device for p in ports if any(kw in p.description.lower() for kw in ['esp', 'ch340', 'cp210'])]
-    except:
+        return [p.device for p in ports if any(kw in (p.description or "").lower() for kw in ['esp', 'ch340', 'cp210'])]
+    except Exception:
         return []
 
 # -----------------------------------------------------
@@ -191,13 +228,30 @@ def require_key(req):
     return req.headers.get("x-api-key") == WRITE_API_KEY
 
 # -----------------------------------------------------
-# ROUTES - COMPLETE SYSTEM
+# SIMULATION: MJPEG generator for static image
+# -----------------------------------------------------
+def _mjpeg_generator(path):
+    """Yield MJPEG frames repeatedly using a static JPEG file."""
+    try:
+        with open(path, "rb") as f:
+            frame = f.read()
+    except Exception:
+        logger.error("Failed to open placeholder for MJPEG: %s", path)
+        return
+    boundary = b"--frame\r\n"
+    part_header = b"Content-Type: image/jpeg\r\n\r\n"
+    while True:
+        yield boundary + part_header + frame + b'\r\n'
+        time.sleep(0.5)
+
+# -----------------------------------------------------
+# ROUTES
 # -----------------------------------------------------
 @app.route("/")
 def home():
     esp_status = "✅ Live" if SERIAL_AVAILABLE and connect_esp() else "⏭️ Disabled"
-    camera_status = "✅ Live" if OPENCV_AVAILABLE and cap and cap.isOpened() else "⏭️ Disabled"
-    if OPENCV_AVAILABLE and not cap:
+    camera_status = "✅ Live" if OPENCV_AVAILABLE and cap and getattr(cap, "isOpened", lambda: False)() else "⏭️ Disabled"
+    if OPENCV_AVAILABLE and (cap is None or not getattr(cap, "isOpened", lambda: False)()):
         init_camera()
     return jsonify({
         "status": "ok",
@@ -212,34 +266,50 @@ def home():
 
 @app.route('/stream')
 def video_feed():
+    # Camera simulation override
+    if os.environ.get("CAMERA_SIMULATE") == "1":
+        _ensure_placeholder()
+        if not os.path.exists(PLACEHOLDER_PATH):
+            return jsonify({"error": "Missing static/snap.jpg for camera simulation"}), 503
+        return Response(_mjpeg_generator(PLACEHOLDER_PATH), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    # Real camera path
     if not OPENCV_AVAILABLE:
         return jsonify({"error": "Camera unavailable"}), 503
-    if not cap or not cap.isOpened():
+    if not cap or not getattr(cap, "isOpened", lambda: False)():
         if not init_camera():
             return jsonify({"error": "No camera detected"}), 503
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/snap')
 def snap():
+    # Simulation first
+    if os.environ.get("CAMERA_SIMULATE") == "1":
+        _ensure_placeholder()
+        if not os.path.exists(PLACEHOLDER_PATH):
+            return jsonify({"error": "Missing static/snap.jpg for camera simulation"}), 503
+        return send_file(PLACEHOLDER_PATH, mimetype="image/jpeg")
+
+    # Real camera
     if not OPENCV_AVAILABLE:
         return jsonify({"error": "Camera unavailable"}), 503
-    if not cap or not cap.isOpened():
+    if not cap or not getattr(cap, "isOpened", lambda: False)():
         init_camera()
-    if not cap or not cap.isOpened():
-        return "No camera", 503
+    if not cap or not getattr(cap, "isOpened", lambda: False)():
+        return jsonify({"error": "No camera"}), 503
     ret, frame = cap.read()
     if ret:
         ret, buffer = cv2.imencode('.jpg', frame)
         return Response(buffer.tobytes(), mimetype='image/jpeg')
-    return "Capture failed", 500
+    return jsonify({"error": "Capture failed"}), 500
 
 @app.route('/api/camera/status')
 def camera_status():
     return jsonify({
-        "live": OPENCV_AVAILABLE and cap and cap.isOpened() if OPENCV_AVAILABLE else False,
+        "live": OPENCV_AVAILABLE and cap and getattr(cap, "isOpened", lambda: False)() if OPENCV_AVAILABLE else False,
         "available": OPENCV_AVAILABLE,
         "device": 1,
-        "resolution": "640x480@15fps uyvy422"
+        "resolution": "640x480@15fps (pref)"
     })
 
 @app.route("/api/v1/readings", methods=["POST"])
@@ -303,6 +373,19 @@ def toggle_light():
         "light_status": status,
         "success": success
     }), 200
+    
+@app.route("/admin/clear-readings", methods=["POST"])
+def clear_readings():
+    if not require_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    try:
+        num_deleted = db.session.query(VictimReading).delete()
+        db.session.commit()
+        return jsonify({"status": "cleared", "deleted": num_deleted}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+        
 
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
@@ -334,6 +417,7 @@ def admin_init_db():
         db.create_all()
         return jsonify({"status": "Tables created"}), 200
     except Exception as e:
+        logger.error("init-db failed: %s", e)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/clean-duplicates", methods=["POST"])
@@ -341,17 +425,21 @@ def clean_duplicates():
     if not require_key(request):
         return jsonify({"error": "Unauthorized"}), 401
     try:
-        result = db.session.query(
-            VictimReading.victim_id, db.func.max(VictimReading.timestamp).label('max_ts')
+        # keep most recent per victim_id
+        subq = db.session.query(
+            VictimReading.victim_id,
+            db.func.max(VictimReading.timestamp).label('max_ts')
         ).group_by(VictimReading.victim_id).subquery()
+
         deleted = db.session.query(VictimReading).filter(
-            ~VictimReading.timestamp.in_(db.session.query(result.c.max_ts))
+            ~VictimReading.timestamp.in_(db.session.query(subq.c.max_ts))
         ).delete(synchronize_session=False)
         db.session.commit()
         return jsonify({"status": "cleaned", "deleted": deleted}), 200
-    except:
+    except Exception as e:
         db.session.rollback()
-        return jsonify({"error": "Cleanup failed"}), 500
+        logger.error("clean-duplicates failed: %s", e)
+        return jsonify({"error": "Cleanup failed", "detail": str(e)}), 500
 
 @app.route("/api/v1/readings/export/pdf", methods=["GET"])
 def export_readings_pdf():
@@ -364,19 +452,19 @@ def export_readings_pdf():
     buffer = BytesIO()
     p = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    
+
     p.setFont("Helvetica-Bold", 16)
     p.drawString(50, height-50, "RESCUE RADAR - Victim Report")
     p.setFont("Helvetica", 10)
     p.drawString(50, height-75, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    
+
     y = height - 120
     p.setFont("Helvetica-Bold", 9)
     headers = ["ID", "Victim ID", "Distance", "Lat", "Lon", "Time"]
     x_pos = [50, 120, 220, 320, 390, 460]
     for i, h in enumerate(headers):
         p.drawString(x_pos[i], y, h)
-    
+
     p.setFont("Helvetica", 8)
     y -= 20
     for r in readings:
@@ -388,34 +476,39 @@ def export_readings_pdf():
                 p.drawString(x_pos[i], y, h)
             y -= 20
             p.setFont("Helvetica", 8)
-        
+
         p.drawString(x_pos[0], y, str(r.id))
-        p.drawString(x_pos[1], y, r.victim_id[:15])
+        p.drawString(x_pos[1], y, (r.victim_id or "")[:15])
         p.drawString(x_pos[2], y, f"{r.distance_cm:.1f}cm")
-        p.drawString(x_pos[3], y, f"{r.latitude:.4f}" if r.latitude else "N/A")
-        p.drawString(x_pos[4], y, f"{r.longitude:.4f}" if r.longitude else "N/A")
+        p.drawString(x_pos[3], y, f"{r.latitude:.4f}" if r.latitude is not None else "N/A")
+        p.drawString(x_pos[4], y, f"{r.longitude:.4f}" if r.longitude is not None else "N/A")
         p.drawString(x_pos[5], y, r.timestamp.strftime("%H:%M"))
         y -= 15
-    
+
     p.showPage()
     p.save()
     buffer.seek(0)
     return send_file(buffer, as_attachment=True,
-                    download_name=f"rescue_report_{datetime.now().strftime('%Y%m%d')}.pdf",
-                    mimetype="application/pdf")
+                     download_name=f"rescue_report_{datetime.now().strftime('%Y%m%d')}.pdf",
+                     mimetype="application/pdf")
 
 # -----------------------------------------------------
 # STARTUP
 # -----------------------------------------------------
 if __name__ == "__main__":
+    # Create tables and optionally init camera
     with app.app_context():
         db.create_all()
+        if os.environ.get("CAMERA_SIMULATE") == "1":
+            _ensure_placeholder()
         if OPENCV_AVAILABLE:
             init_camera()
+
     logger.info("=" * 50)
     logger.info("🚀 RESCUE RADAR FULL SYSTEM")
-    logger.info(f"📡 Local: http://0.0.0.0:5001 | Cloud: {DATABASE_URL and 'YES' or 'NO'}")
+    logger.info(f"📡 Local: http://0.0.0.0:5001 | Cloud: {'YES' if DATABASE_URL else 'NO'}")
     logger.info(f"🎥 Camera: {'✅ LIVE' if OPENCV_AVAILABLE and cap else '❌ OFF'}")
     logger.info(f"🔌 ESP32: {'✅ READY' if SERIAL_AVAILABLE else '❌ OFF'}")
     logger.info("=" * 50)
+
     app.run(host="0.0.0.0", port=5001, debug=True, threaded=True)
