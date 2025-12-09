@@ -346,6 +346,18 @@ def home():
         "serial": SERIAL_AVAILABLE,
         "ports": find_esp_ports()
     }), 200
+    
+    @app.route("/admin/reset-db", methods=["POST"])
+def reset_db():
+    if not require_key(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    try:
+        db.drop_all()
+        db.create_all()
+        return jsonify({"status": "database reset success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/stream")
 def video_feed():
