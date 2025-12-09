@@ -295,23 +295,32 @@ def find_esp_ports():
 # -----------------------------------------------------
 class VictimReading(db.Model):
     __tablename__ = "victim_readings"
+
     id = db.Column(db.Integer, primary_key=True)
-    victim_id = db.Column(db.String(64), nullable=False, index=True, unique=True)
+    victim_id = db.Column(db.String(64), nullable=False, index=True)
+
     distance_cm = db.Column(db.Float, nullable=False)
+    temperature_c = db.Column(db.Float)
+    humidity_pct = db.Column(db.Float)
+    gas_ppm = db.Column(db.Float)
+
     latitude = db.Column(db.Float)
     longitude = db.Column(db.Float)
+
     timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self):
-        ts = self.timestamp
-        iso_ts = ts.replace(tzinfo=None).isoformat() + "Z" if isinstance(ts, datetime) else str(ts)
         return {
-            "id": self.id, "victim_id": self.victim_id, "distance_cm": self.distance_cm,
-            "latitude": self.latitude, "longitude": self.longitude, "timestamp": iso_ts
+            "id": self.id,
+            "victim_id": self.victim_id,
+            "distance_cm": self.distance_cm,
+            "temperature_c": self.temperature_c,
+            "humidity_pct": self.humidity_pct,
+            "gas_ppm": self.gas_ppm,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "timestamp": self.timestamp.isoformat() + "Z"
         }
-
-def require_key(req):
-    return req.headers.get("x-api-key") == WRITE_API_KEY
 
 # -----------------------------------------------------
 # SIMULATION: MJPEG generator for static image
@@ -402,42 +411,43 @@ def camera_status():
 def create_reading():
     if not require_key(request):
         return jsonify({"error": "Unauthorized"}), 401
+
     data = request.get_json() or {}
-    distance_cm = data.get("distance_cm")
-    if distance_cm is None:
-        return jsonify({"error": "distance_cm required"}), 400
-    try:
-        distance_cm = float(distance_cm)
-        if not 0 <= distance_cm <= 10000:
-            return jsonify({"error": "Invalid distance"}), 400
-    except:
-        return jsonify({"error": "Invalid number"}), 400
 
-    victim_id = data.get("victim_id") or f"vic-{uuid.uuid4().hex[:8]}"
     try:
-        reading = VictimReading.query.filter_by(victim_id=victim_id).first()
-        if reading:
-            reading.distance_cm = distance_cm
-            reading.latitude = data.get("latitude")
-            reading.longitude = data.get("longitude")
-            reading.timestamp = datetime.utcnow()
-            action = "UPDATED"
-        else:
-            reading = VictimReading(
-                victim_id=victim_id, distance_cm=distance_cm,
-                latitude=data.get("latitude"), longitude=data.get("longitude"),
-                timestamp=datetime.utcnow()
-            )
-            db.session.add(reading)
-            action = "CREATED"
+        reading = VictimReading(
+            victim_id = data.get("victim_id", f"vic-{uuid.uuid4().hex[:8]}"),
+
+            distance_cm = float(data["distance_cm"]),
+            temperature_c = data.get("temperature_c"),
+            humidity_pct = data.get("humidity_pct"),
+            gas_ppm = data.get("gas_ppm"),
+
+            latitude = data.get("latitude"),
+            longitude = data.get("longitude"),
+        )
+
+        db.session.add(reading)
         db.session.commit()
-        logger.info("%s victim %s: %.1fcm", action, victim_id, distance_cm)
-        return jsonify({"status": "ok", "action": action, "reading": reading.to_dict()}), 200
-    except SQLAlchemyError as e:
-        db.session.rollback()
-        logger.error(f"DB error: {e}")
-        return jsonify({"error": "Database error"}), 500
 
+        logger.info(
+            "📡 Reading | %s | %.1fcm | %.1f°C | %.1f%% | %.1fppm",
+            reading.victim_id,
+            reading.distance_cm,
+            reading.temperature_c or -1,
+            reading.humidity_pct or -1,
+            reading.gas_ppm or -1
+        )
+
+        return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
+
+    except KeyError as e:
+        return jsonify({"error": f"Missing field {str(e)}"}), 400
+
+    except Exception as e:
+        db.session.rollback()
+        logger.error("DB insert failed: %s", e)
+        return jsonify({"error": "Database error"}), 500
 @app.route("/send-sos", methods=["POST"])
 def send_sos():
     success = send_esp_command("SOS_ON") if SERIAL_AVAILABLE else False
