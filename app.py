@@ -1,523 +1,366 @@
-# app.py - RESCUE RADAR backend (Railway MySQL ready)
-
-import pkgutil, importlib.util, os, base64, logging, time, uuid
+import os
+import logging
+import time
+import threading
 from datetime import datetime
-from io import BytesIO
 
-from flask import Flask, request, jsonify, send_file, Response
+from flask import Flask, request, jsonify, Response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from sqlalchemy.exc import SQLAlchemyError
 
-# Optional diagnostics
-try:
-    import faulthandler; faulthandler.enable()
-except Exception:
-    pass
+# Optional heavy deps (YOLO, OpenCV) only when running locally
+RUN_HEAVY_ML = not os.environ.get("RAILWAY_ENVIRONMENT")
 
-# pkgutil.get_loader shim (for some environments)
-if not hasattr(pkgutil, "get_loader"):
-    def _compat_get_loader(name):
-        try:
-            spec = importlib.util.find_spec(name)
-            return spec.loader if spec else None
-        except Exception:
-            return None
-    pkgutil.get_loader = _compat_get_loader
-
-# Logging
-logger = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-# Feature flags
-PORT = int(os.environ.get("PORT", "5001"))
-CAMERA_SIMULATE = os.environ.get("CAMERA_SIMULATE", "1") == "1"
-DISABLE_SERIAL = os.environ.get("DISABLE_SERIAL", "1") == "1"
-
-# Optional deps
-SERIAL_AVAILABLE = False
-OPENCV_AVAILABLE = False
-try:
-    import serial, serial.tools.list_ports
-    SERIAL_AVAILABLE = True
-except Exception:
-    logger.warning("pyserial not available - ESP32 disabled")
-try:
+if RUN_HEAVY_ML:
+    from ultralytics import YOLO
     import cv2
-    OPENCV_AVAILABLE = True
-except Exception:
-    logger.warning("opencv-python not available - camera disabled")
-if DISABLE_SERIAL:
-    SERIAL_AVAILABLE = False
-    logger.info("Serial explicitly disabled via DISABLE_SERIAL=1")
+    import numpy as np
 
-esp_serial = None
-cap = None
-
-# Flask app
+# ==================== FLASK SETUP ====================
 app = Flask(__name__)
 CORS(app)
 
-# Database (MySQL on Railway via PyMySQL)
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///local_dev.db?check_same_thread=False"
-    logger.info("Using SQLite (local) - set DATABASE_URL for Railway MySQL (mysql+pymysql://...)")
-else:
-    # Ensure mysql+pymysql scheme; append charset for emojis
-    if DATABASE_URL.startswith("mysql://"):
-        DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
-    if "charset=" not in DATABASE_URL:
-        sep = "&" if "?" in DATABASE_URL else "?"
-        DATABASE_URL = f"{DATABASE_URL}{sep}charset=utf8mb4"
-    app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
-    logger.info("Using DATABASE_URL for DB (MySQL)")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# ==================== DATABASE SETUP ====================
+# Prefer remote DB from env (Railway), else fallback to local SQLite
+db_url = os.environ.get("DATABASE_URL", "sqlite:///rescue_radar.db")
+if db_url.startswith("mysql://"):
+    # Use PyMySQL driver
+    db_url = db_url.replace("mysql://", "mysql+pymysql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_pre_ping": True,
-    "pool_recycle": 280,
-}
-WRITE_API_KEY = os.environ.get("WRITE_API_KEY", "rescue-radar-dev")
-ESP_PORT = os.environ.get("ESP_PORT", "/dev/cu.usbserial-*")
-BAUD_RATE = int(os.environ.get("BAUD_RATE", 115200))
-
 db = SQLAlchemy(app)
 
-# Static placeholder for camera simulate
-STATIC_DIR = os.path.join(os.getcwd(), "static")
-os.makedirs(STATIC_DIR, exist_ok=True)
-PLACEHOLDER_PATH = os.path.join(STATIC_DIR, "snap.jpg")
-_PLACEHOLDER_BASE64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxISEhUTEhIVFRUVFRUVFRUVFRUVFRUVFRUWFhUV"
-    "FRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMtNygtLisBCgoKDg0OGxAQGy0lICYtLS0tLS0tLS0t"
-    "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAKAAoAMBIgACEQEDEQH/xAAb"
-    "AAACAwEBAQAAAAAAAAAAAAAEBQIDBgEHAP/EADQQAAIBAgQDBgQFBQAAAAAAAAECAwQRAAUSIRMx"
-    "QWFxgZGh8AUiMqHB0fAUM2KSscH/xAAaAQACAwEBAAAAAAAAAAAAAAABAgADBAUG/8QALBEAAgIB"
-    "AwMCBwAAAAAAAAAAAQIAEQMSITEEMkFRcQQiMlJhgaGx/9oADAMBAAIRAxEAPwD8qKqurq6urrq6"
-    "urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6v/2Q=="
-)
-def _ensure_placeholder():
-    if not os.path.exists(PLACEHOLDER_PATH):
-        try:
-            with open(PLACEHOLDER_PATH, "wb") as f:
-                f.write(base64.b64decode(_PLACEHOLDER_BASE64))
-            logger.info("Created placeholder static/snap.jpg for CAMERA_SIMULATE")
-        except Exception as e:
-            logger.error("Failed to create placeholder image: %s", e)
 
-# --------------- Camera helpers ---------------
-def init_camera():
-    global cap
-    if CAMERA_SIMULATE:
-        logger.info("Camera simulate mode enabled; skipping real camera init")
-        return False
-    if not OPENCV_AVAILABLE:
-        logger.info("Camera skipped (no OpenCV)")
-        return False
-    if cap is not None:
-        try: cap.release()
-        except Exception: pass
-        cap = None
+class VictimReading(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    victimid = db.Column(db.String(64), nullable=False, unique=True)
+    distancecm = db.Column(db.Float, nullable=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+# ==================== YOLO & CAMERA (LOCAL ONLY) ====================
+yolo_model = None
+cap = None
+cap_lock = threading.Lock()
+
+
+def safe_init_yolo():
+    """Load YOLO only when heavy ML is enabled (local)."""
+    global yolo_model
+    if not RUN_HEAVY_ML:
+        return
+
     try:
-        for device_idx in [0, 1, 2]:
-            test_cap = None
+        print("🚀 Loading YOLOv8 (local only)...")
+        if os.path.exists("best.pt"):
+            yolo_model = YOLO("best.pt")
+            print("✅ YOUR best.pt LOADED!")
+        elif os.path.exists("yolov8n.pt"):
+            yolo_model = YOLO("yolov8n.pt")
+            print("✅ yolov8n.pt LOADED!")
+        else:
+            yolo_model = YOLO("yolov8n.pt")
+            print("✅ YOLOv8n AUTO-DOWNLOADED!")
+        print("✅ YOLOv8 READY FOR LIVE STREAM (LOCAL)!")
+    except Exception as e:
+        print(f"❌ YOLO Error: {e}")
+        yolo_model = None
+
+
+def init_camera():
+    """Auto-detect USB camera (LOCAL ONLY)."""
+    if not RUN_HEAVY_ML:
+        return False
+
+    global cap
+    with cap_lock:
+        # Cleanup old
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = None
+
+        # Try multiple indices
+        for device_idx in [0, 1, 2, 3, 4]:
             try:
                 test_cap = cv2.VideoCapture(device_idx)
                 if not test_cap.isOpened():
-                    try: test_cap.release()
-                    except Exception: pass
+                    test_cap.release()
                     continue
-                test_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc("U", "Y", "V", "Y"))
+
                 test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 test_cap.set(cv2.CAP_PROP_FPS, 15)
-                try: test_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception: pass
+                test_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
                 ret, frame = test_cap.read()
                 if ret and frame is not None and frame.size > 0:
                     cap = test_cap
                     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    logger.info(f"✅ ENDOSCOPE LIVE: {width}x{height} uyvy422 (device {device_idx})")
+                    logger.info(f"✅ CAMERA LIVE: {width}x{height} @ device {device_idx}")
                     return True
-                else:
-                    try: test_cap.release()
-                    except Exception: pass
-            except Exception as e:
-                logger.warning(f"Camera index {device_idx} failed: {e}")
-                try:
-                    if test_cap is not None: test_cap.release()
-                except Exception: pass
+                test_cap.release()
+            except Exception:
                 continue
-        logger.warning("No working camera found")
-        return False
-    except Exception as e:
-        logger.error(f"Camera initialization error: {e}")
+
+        logger.warning("⚠️ No camera found - will use placeholder.")
         return False
 
-def gen_frames():
-    global cap
-    frame_count = 0
+
+def thermal_overlay(frame):
+    """Red=Hot, Blue=Cold thermal effect."""
+    if not RUN_HEAVY_ML:
+        return frame
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        thermal = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+        return cv2.addWeighted(frame, 0.7, thermal, 0.3, 0)
+    except Exception:
+        return frame
+
+
+def draw_ml_boxes(frame, results):
+    """Draw YOLO boxes + confidence."""
+    if not RUN_HEAVY_ML or results is None:
+        return frame, 0, 0, 0.0
+
+    try:
+        humans = 0
+        best_conf = 0.0
+
+        if hasattr(results[0], "boxes") and results[0].boxes is not None:
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                label = results[0].names.get(cls_id, "object")
+
+                if label.lower() == "person":
+                    humans += 1
+                    best_conf = max(best_conf, conf)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(
+                        frame,
+                        f"HUMAN {conf:.0%}",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 255),
+                        2,
+                    )
+
+        color = (0, 0, 255) if best_conf > 0.5 else (0, 255, 0)
+        cv2.putText(
+            frame, f"HUMANS: {humans}", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
+        )
+        cv2.putText(
+            frame, f"CONF: {best_conf:.0%}", (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
+        )
+
+        return frame, humans, 0, best_conf
+    except Exception:
+        return frame, 0, 0, 0.0
+
+
+def gen_frames_ml():
+    """Main MJPEG generator (LOCAL ONLY)."""
+    if not RUN_HEAVY_ML or yolo_model is None:
+        # On Railway this generator should not be called
+        while True:
+            time.sleep(1)
+            yield b""
+
     consecutive_errors = 0
-    max_errors = 10
     while True:
         try:
-            if CAMERA_SIMULATE:
-                time.sleep(0.5); continue
-            if cap is None or not getattr(cap, "isOpened", lambda: False)():
-                logger.warning("Camera not available, reinitializing...")
-                if not init_camera():
-                    logger.error("Failed to reinitialize camera")
-                    time.sleep(1); continue
+            with cap_lock:
+                if cap is None or not cap.isOpened():
+                    if not init_camera():
+                        time.sleep(2)
+                        continue
+
             ret, frame = cap.read()
             if not ret or frame is None:
                 consecutive_errors += 1
-                if consecutive_errors > max_errors:
-                    logger.error("Too many consecutive read failures, reinitializing camera")
-                    try: cap.release()
-                    except Exception: pass
-                    cap = None
-                    if not init_camera():
-                        time.sleep(1); continue
-                    consecutive_errors = 0
-                else:
-                    time.sleep(0.1)
+                if consecutive_errors > 5:
+                    init_camera()
+                time.sleep(0.1)
                 continue
+
             consecutive_errors = 0
-            try:
-                if len(frame.shape) == 3:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                if ret:
-                    frame_bytes = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
-                    yield frame_bytes
-                    frame_count += 1
-                    if frame_count % 60 == 0:
-                        logger.info(f"Streaming {frame_count} frames...")
-                else:
-                    logger.warning("Failed to encode frame"); time.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Frame processing error: {e}"); time.sleep(0.1); continue
+
+            results = yolo_model(frame, conf=0.25, verbose=False, device="cpu")
+            enhanced = thermal_overlay(frame)
+            final_frame, humans, animals, conf = draw_ml_boxes(enhanced, results)
+
+            ret, buffer = cv2.imencode(".jpg", final_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ret:
+                frame_bytes = (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+                )
+                yield frame_bytes
+
         except Exception as e:
-            logger.error(f"Generator error: {e}")
-            consecutive_errors += 1
-            if consecutive_errors > max_errors:
-                logger.error("Too many errors, reinitializing camera")
-                try:
-                    if cap is not None: cap.release()
-                except Exception: pass
-                cap = None
-                if not init_camera():
-                    time.sleep(1); continue
-                consecutive_errors = 0
-            else:
-                time.sleep(0.5)
+            logger.error(f"Frame gen error: {e}")
+            time.sleep(0.1)
 
-# --------------- ESP32 helpers ---------------
-def connect_esp():
-    if not SERIAL_AVAILABLE: return False
-    global esp_serial
-    try:
-        if esp_serial and getattr(esp_serial, "is_open", False):
-            return True
-        esp_serial = serial.Serial(ESP_PORT, BAUD_RATE, timeout=1)
-        time.sleep(2)
-        logger.info(f"ESP32 connected: {ESP_PORT}")
-        return True
-    except Exception as e:
-        logger.error(f"ESP32 failed: {e}")
-        return False
 
-def send_esp_command(cmd):
-    if not SERIAL_AVAILABLE: return False
-    if not connect_esp(): return False
-    try:
-        esp_serial.write(f"{cmd}\n".encode()); esp_serial.flush()
-        logger.info(f"ESP CMD: {cmd}")
-        return True
-    except Exception as e:
-        logger.error("Failed to send ESP command: %s", e)
-        return False
-
-def find_esp_ports():
-    if not SERIAL_AVAILABLE: return []
-    try:
-        ports = serial.tools.list_ports.comports()
-        return [p.device for p in ports if any(kw in (p.description or "").lower() for kw in ["esp", "ch340", "cp210"])]
-    except Exception:
-        return []
-
-# --------------- Models ---------------
-class VictimReading(db.Model):
-    __tablename__ = "victim_readings"
-    id = db.Column(db.Integer, primary_key=True)
-    victim_id = db.Column(db.String(64), nullable=False, index=True, unique=True)
-    distance_cm = db.Column(db.Float, nullable=False)
-    latitude = db.Column(db.Float)
-    longitude = db.Column(db.Float)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    def to_dict(self):
-        ts = self.timestamp
-        iso_ts = ts.replace(tzinfo=None).isoformat() + "Z" if isinstance(ts, datetime) else str(ts)
-        return {
-            "id": self.id,
-            "victim_id": self.victim_id,
-            "distance_cm": self.distance_cm,
-            "latitude": self.latitude,
-            "longitude": self.longitude,
-            "timestamp": iso_ts,
-        }
-
-def require_key(req):
-    return req.headers.get("x-api-key") == WRITE_API_KEY
-
-# --------------- MJPEG simulation ---------------
-def _mjpeg_generator(path):
-    try:
-        with open(path, "rb") as f:
-            frame = f.read()
-    except Exception:
-        logger.error("Failed to open placeholder for MJPEG: %s", path)
-        return
-    boundary = b"--frame\r\n"; header = b"Content-Type: image/jpeg\r\n\r\n"
-    while True:
-        yield boundary + header + frame + b"\r\n"; time.sleep(0.5)
-
-# --------------- Routes ---------------
-@app.route("/")
-def home():
-    esp_status = "✅ Live" if SERIAL_AVAILABLE and connect_esp() else "⏭️ Disabled"
-    camera_status = (
-        "🖼️ Simulated" if CAMERA_SIMULATE
-        else ("✅ Live" if OPENCV_AVAILABLE and cap and getattr(cap, "isOpened", lambda: False)() else "⏭️ Disabled")
-    )
-    if OPENCV_AVAILABLE and not CAMERA_SIMULATE and (cap is None or not getattr(cap, "isOpened", lambda: False)()):
-        init_camera()
-    return jsonify({
-        "status": "ok",
-        "msg": "RESCUE RADAR - FULL SYSTEM LIVE",
-        "environment": "cloud" if DATABASE_URL else "local dev",
-        "esp32": esp_status,
-        "camera": camera_status,
-        "opencv": OPENCV_AVAILABLE,
-        "serial": SERIAL_AVAILABLE,
-        "ports": find_esp_ports(),
-    }), 200
-
+# ==================== ROUTES ====================
 @app.route("/stream")
 def video_feed():
-    if CAMERA_SIMULATE:
-        _ensure_placeholder()
-        if not os.path.exists(PLACEHOLDER_PATH):
-            return jsonify({"error": "Missing static/snap.jpg for camera simulation"}), 503
-        return Response(_mjpeg_generator(PLACEHOLDER_PATH), mimetype="multipart/x-mixed-replace; boundary=frame")
-    if not OPENCV_AVAILABLE:
-        return jsonify({"error": "Camera unavailable"}), 503
-    if not cap or not getattr(cap, "isOpened", lambda: False)():
-        if not init_camera():
-            return jsonify({"error": "No camera detected"}), 503
-    return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    """Live stream (LOCAL only; disabled on Railway)."""
+    if not RUN_HEAVY_ML or yolo_model is None:
+        return jsonify({"error": "Live stream not available on server"}), 503
+    return Response(gen_frames_ml(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 @app.route("/snap")
 def snap():
-    if CAMERA_SIMULATE:
-        _ensure_placeholder()
-        if not os.path.exists(PLACEHOLDER_PATH):
-            return jsonify({"error": "Missing static/snap.jpg for camera simulation"}), 503
-        return send_file(PLACEHOLDER_PATH, mimetype="image/jpeg")
-    if not OPENCV_AVAILABLE:
-        return jsonify({"error": "Camera unavailable"}), 503
-    if not cap or not getattr(cap, "isOpened", lambda: False)():
-        init_camera()
-    if not cap or not getattr(cap, "isOpened", lambda: False)():
-        return jsonify({"error": "No camera"}), 503
-    ret, frame = cap.read()
-    if ret:
-        ret, buffer = cv2.imencode(".jpg", frame)
-        return Response(buffer.tobytes(), mimetype="image/jpeg")
-    return jsonify({"error": "Capture failed"}), 500
+    """Single ML snapshot (LOCAL only)."""
+    if not RUN_HEAVY_ML or yolo_model is None:
+        return jsonify({"error": "Snapshot not available on server"}), 503
+
+    try:
+        with cap_lock:
+            if cap is None or not cap.isOpened():
+                if not init_camera():
+                    return jsonify({"error": "No camera"}), 503
+
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                results = yolo_model(frame, conf=0.25, verbose=False)
+                enhanced = thermal_overlay(frame)
+                final_frame, _, _, _ = draw_ml_boxes(enhanced, results)
+
+                ret, buffer = cv2.imencode(".jpg", final_frame)
+                return Response(buffer.tobytes(), mimetype="image/jpeg")
+
+        return jsonify({"error": "Capture failed"}), 500
+    except Exception as e:
+        logger.error(f"Snapshot error: {e}")
+        return jsonify({"error": "Snapshot error"}), 500
+
 
 @app.route("/api/camera/status")
 def camera_status():
+    if not RUN_HEAVY_ML:
+        return jsonify({
+            "live": False,
+            "available": False,
+            "resolution": None,
+            "fps": None,
+            "environment": "railway"
+        })
+
+    with cap_lock:
+        live = cap is not None and cap.isOpened()
     return jsonify({
-        "live": False if CAMERA_SIMULATE else (OPENCV_AVAILABLE and cap and getattr(cap, "isOpened", lambda: False)()),
-        "available": OPENCV_AVAILABLE and not CAMERA_SIMULATE,
-        "device": 1,
-        "resolution": "640x480@15fps (pref)",
-        "simulated": CAMERA_SIMULATE,
+        "live": live,
+        "available": True,
+        "resolution": "640x480",
+        "fps": 15,
+        "environment": "local"
     })
+
 
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
-    if not require_key(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json() or {}
-    distance_cm = data.get("distance_cm")
-    if distance_cm is None:
-        return jsonify({"error": "distance_cm required"}), 400
+    """Victim report endpoint."""
     try:
-        distance_cm = float(distance_cm)
-        if not 0 <= distance_cm <= 10000:
-            return jsonify({"error": "Invalid distance"}), 400
-    except Exception:
-        return jsonify({"error": "Invalid number"}), 400
-    victim_id = data.get("victim_id") or f"vic-{uuid.uuid4().hex[:8]}"
-    try:
-        reading = VictimReading.query.filter_by(victim_id=victim_id).first()
+        data = request.get_json() or {}
+        distancecm = data.get("distancecm")
+
+        if distancecm is None:
+            return jsonify({"error": "distancecm required"}), 400
+
+        distancecm = float(distancecm)
+        victimid = data.get("victimid", f"vic-{int(time.time())}")
+
+        reading = VictimReading.query.filter_by(victimid=victimid).first()
         if reading:
-            reading.distance_cm = distance_cm
+            reading.distancecm = distancecm
             reading.latitude = data.get("latitude")
             reading.longitude = data.get("longitude")
             reading.timestamp = datetime.utcnow()
+            db.session.commit()
             action = "UPDATED"
         else:
             reading = VictimReading(
-                victim_id=victim_id,
-                distance_cm=distance_cm,
+                victimid=victimid,
+                distancecm=distancecm,
                 latitude=data.get("latitude"),
                 longitude=data.get("longitude"),
-                timestamp=datetime.utcnow(),
             )
             db.session.add(reading)
+            db.session.commit()
             action = "CREATED"
-        db.session.commit()
-        logger.info("%s victim %s: %.1fcm", action, victim_id, distance_cm)
-        return jsonify({"status": "ok", "action": action, "reading": reading.to_dict()}), 200
-    except SQLAlchemyError as e:
-        db.session.rollback()
-        logger.error(f"DB error: {e}")
-        return jsonify({"error": "Database error"}), 500
 
-@app.route("/send-sos", methods=["POST"])
-def send_sos():
-    success = send_esp_command("SOS_ON") if SERIAL_AVAILABLE else False
-    logger.info("🚨 SOS pressed - ESP32: %s", "sent" if success else "disabled")
-    return jsonify({"status": "sos_triggered", "success": success, "message": "Buzzer activated" if success else "ESP32 unavailable"}), 200
+        logger.info(f"👥 {action}: {victimid} @ {distancecm:.1f}cm")
 
-@app.route("/toggle-light", methods=["POST"])
-def toggle_light():
-    data = request.get_json() or {}
-    status = data.get("status", "OFF")
-    cmd = "LIGHT_ON" if status.upper() == "ON" else "LIGHT_OFF"
-    success = send_esp_command(cmd) if SERIAL_AVAILABLE else False
-    return jsonify({"status": "light_toggled", "light_status": status, "success": success}), 200
+        return jsonify({
+            "status": "ok",
+            "action": action,
+            "reading": {
+                "victimid": reading.victimid,
+                "distancecm": reading.distancecm,
+                "latitude": reading.latitude,
+                "longitude": reading.longitude,
+            },
+        }), 200
 
-@app.route("/admin/clear-readings", methods=["POST"])
-def clear_readings():
-    if not require_key(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    try:
-        num_deleted = db.session.query(VictimReading).delete()
-        db.session.commit()
-        return jsonify({"status": "cleared", "deleted": num_deleted}), 200
     except Exception as e:
+        logger.error(f"Victim report error: {e}")
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/v1/readings/all", methods=["GET"])
-def all_readings():
-    page = request.args.get("page", 1, type=int)
-    per_page = min(request.args.get("per_page", 50, type=int), 100)
-    readings = VictimReading.query.order_by(VictimReading.timestamp.desc()).paginate(page=page, per_page=per_page, error_out=False)
-    return jsonify({
-        "readings": [r.to_dict() for r in readings.items],
-        "page": page, "per_page": per_page,
-        "total": readings.total, "pages": readings.pages
-    }), 200
 
-@app.route("/api/esp/status", methods=["GET"])
-def esp_status():
-    return jsonify({
-        "connected": SERIAL_AVAILABLE and connect_esp(),
-        "available": SERIAL_AVAILABLE,
-        "port": ESP_PORT,
-        "ports": find_esp_ports()
-    })
+@app.route("/")
+def home():
+    """Simple home page that works both on Railway and locally."""
+    env = "LOCAL+ML" if RUN_HEAVY_ML else "RAILWAY"
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>🚨 RESCUE RADAR LIVE ({env})</title></head>
+    <body style="font-family:Arial;margin:40px;background:#1a1a1a;color:white;text-align:center;">
+        <h1 style="color:#00ff00;">🚨 RESCUE RADAR v2.0 ✅ ({env})</h1>
+        <p><strong>Victim API Online</strong></p>
+        <p>POST <code>/api/v1/readings</code> with JSON body from Flutter.</p>
+        <p>Camera/YOLO stream is only available when running locally.</p>
+        <p>Flutter Stream URL (local only): <code>http://localhost:5001/stream</code></p>
+    </body>
+    </html>
+    """
 
-@app.route("/admin/init-db", methods=["POST"])
-def admin_init_db():
-    if not require_key(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    try:
-        db.create_all()
-        return jsonify({"status": "Tables created"}), 200
-    except Exception as e:
-        logger.error("init-db failed: %s", e)
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/admin/clean-duplicates", methods=["POST"])
-def clean_duplicates():
-    if not require_key(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    try:
-        subq = db.session.query(
-            VictimReading.victim_id,
-            db.func.max(VictimReading.timestamp).label("max_ts")
-        ).group_by(VictimReading.victim_id).subquery()
-        deleted = db.session.query(VictimReading).filter(
-            ~VictimReading.timestamp.in_(db.session.query(subq.c.max_ts))
-        ).delete(synchronize_session=False)
-        db.session.commit()
-        return jsonify({"status": "cleaned", "deleted": deleted}), 200
-    except Exception as e:
-        db.session.rollback()
-        logger.error("clean-duplicates failed: %s", e)
-        return jsonify({"error": "Cleanup failed", "detail": str(e)}), 500
+# ==================== STARTUP ====================
+with app.app_context():
+    db.create_all()
 
-@app.route("/api/v1/readings/export/pdf", methods=["GET"])
-def export_readings_pdf():
-    if not require_key(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    readings = VictimReading.query.order_by(VictimReading.timestamp.asc()).limit(5000).all()
-    if not readings:
-        return jsonify({"error": "No readings"}), 404
-    buffer = BytesIO()
-    p = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-    p.setFont("Helvetica-Bold", 16)
-    p.drawString(50, height - 50, "RESCUE RADAR - Victim Report")
-    p.setFont("Helvetica", 10)
-    p.drawString(50, height - 75, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
-    y = height - 120
-    p.setFont("Helvetica-Bold", 9)
-    headers = ["ID", "Victim ID", "Distance", "Lat", "Lon", "Time"]
-    x_pos = [50, 120, 220, 320, 390, 460]
-    for i, h in enumerate(headers):
-        p.drawString(x_pos[i], y, h)
-    p.setFont("Helvetica", 8); y -= 20
-    for r in readings:
-        if y < 100:
-            p.showPage(); y = height - 60
-            p.setFont("Helvetica-Bold", 9)
-            for i, h in enumerate(headers): p.drawString(x_pos[i], y, h)
-            y -= 20; p.setFont("Helvetica", 8)
-        p.drawString(x_pos[0], y, str(r.id))
-        p.drawString(x_pos[1], y, (r.victim_id or "")[:15])
-        p.drawString(x_pos[2], y, f"{r.distance_cm:.1f}cm")
-        p.drawString(x_pos[3], y, f"{r.latitude:.4f}" if r.latitude is not None else "N/A")
-        p.drawString(x_pos[4], y, f"{r.longitude:.4f}" if r.longitude is not None else "N/A")
-        p.drawString(x_pos[5], y, r.timestamp.strftime("%H:%M"))
-        y -= 15
-    p.showPage(); p.save(); buffer.seek(0)
-    return send_file(buffer, as_attachment=True,
-                     download_name=f"rescue_report_{datetime.now().strftime('%Y%m%d')}.pdf",
-                     mimetype="application/pdf")
+if RUN_HEAVY_ML:
+    safe_init_yolo()
+    init_camera()
 
-# --------------- Startup ---------------
+
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-        if CAMERA_SIMULATE:
-            _ensure_placeholder()
-        elif OPENCV_AVAILABLE:
-            init_camera()
-    logger.info("=" * 50)
-    logger.info(f"🚀 RESCUE RADAR FULL SYSTEM")
-    logger.info(f"📡 Listening on http://0.0.0.0:{PORT} | Cloud DB: {'YES' if DATABASE_URL else 'NO'}")
-    logger.info(f"🎥 Camera: {'🖼️ SIM' if CAMERA_SIMULATE else ('✅ LIVE' if OPENCV_AVAILABLE and cap else '❌ OFF')}")
-    logger.info(f"🔌 ESP32: {'✅ READY' if SERIAL_AVAILABLE else '❌ OFF'}")
-    logger.info("=" * 50)
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+    port = int(os.environ.get("PORT", 5001))
+    print("\n" + "=" * 60)
+    print("🚀 RESCUE RADAR BACKEND")
+    print(f"📺 Environment: {'LOCAL+ML' if RUN_HEAVY_ML else 'RAILWAY'}")
+    print(f"🌐 Listening on port {port}")
+    print(f"💾 DB: {db_url}")
+    print("=" * 60 + "\n")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
