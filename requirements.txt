@@ -3,3 +3,5 @@ flask-cors
 flask-sqlalchemy
 gunicorn
 pymysql
+reportlab
+# plus any others you already use (ultralytics, opencv-python-headless, numpy, etc.)
