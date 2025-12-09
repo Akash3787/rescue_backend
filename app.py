@@ -102,7 +102,7 @@ def _ensure_placeholder():
             logger.error("Failed to create placeholder image: %s", e)
 
 # -----------------------------------------------------
-# CAMERA (OpenCV) helpers - your robust version included
+# CAMERA (OpenCV) helpers - robust version
 # -----------------------------------------------------
 def init_camera():
     global cap
@@ -136,7 +136,7 @@ def init_camera():
                 test_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 test_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 test_cap.set(cv2.CAP_PROP_FPS, 15)
-                # not all platforms support BUFFERSIZE; guard it
+                # Not all platforms support BUFFERSIZE; guard it
                 try:
                     test_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except:
@@ -295,8 +295,8 @@ def find_esp_ports():
 # -----------------------------------------------------
 class VictimReading(db.Model):
     __tablename__ = "victim_readings"
-
     id = db.Column(db.Integer, primary_key=True)
+
     victim_id = db.Column(db.String(64), nullable=False, index=True)
 
     distance_cm = db.Column(db.Float, nullable=False)
@@ -319,8 +319,19 @@ class VictimReading(db.Model):
             "gas_ppm": self.gas_ppm,
             "latitude": self.latitude,
             "longitude": self.longitude,
-            "timestamp": self.timestamp.isoformat() + "Z"
+            "timestamp": self.timestamp.isoformat() + "Z" if isinstance(self.timestamp, datetime) else str(self.timestamp),
         }
+
+def require_key(req):
+    return req.headers.get("x-api-key") == WRITE_API_KEY
+
+def _to_float(val):
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
 
 # -----------------------------------------------------
 # SIMULATION: MJPEG generator for static image
@@ -407,6 +418,7 @@ def camera_status():
         "resolution": "640x480@15fps (pref)"
     })
 
+# ----------------- SENSOR READINGS API -----------------
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
     if not require_key(request):
@@ -414,40 +426,57 @@ def create_reading():
 
     data = request.get_json() or {}
 
+    # distance is mandatory
+    if "distance_cm" not in data:
+        return jsonify({"error": "distance_cm required"}), 400
+
+    try:
+        distance_cm = float(data["distance_cm"])
+        if not 0 <= distance_cm <= 10000:
+            return jsonify({"error": "Invalid distance"}), 400
+    except Exception:
+        return jsonify({"error": "Invalid distance number"}), 400
+
+    victim_id = data.get("victim_id", f"vic-{uuid.uuid4().hex[:8]}")
+
     try:
         reading = VictimReading(
-            victim_id = data.get("victim_id", f"vic-{uuid.uuid4().hex[:8]}"),
+            victim_id=victim_id,
+            distance_cm=distance_cm,
 
-            distance_cm = float(data["distance_cm"]),
-            temperature_c = data.get("temperature_c"),
-            humidity_pct = data.get("humidity_pct"),
-            gas_ppm = data.get("gas_ppm"),
+            # Accept both *_c / *_pct / *_ppm and plain names from ESP
+            temperature_c=_to_float(data.get("temperature_c") or data.get("temperature")),
+            humidity_pct=_to_float(data.get("humidity_pct") or data.get("humidity")),
+            gas_ppm=_to_float(data.get("gas_ppm") or data.get("gas")),
 
-            latitude = data.get("latitude"),
-            longitude = data.get("longitude"),
+            latitude=_to_float(data.get("latitude")),
+            longitude=_to_float(data.get("longitude")),
         )
 
         db.session.add(reading)
         db.session.commit()
 
         logger.info(
-            "📡 Reading | %s | %.1fcm | %.1f°C | %.1f%% | %.1fppm",
+            "📡 Reading | %s | %.1fcm | T=%s | H=%s | G=%s | lat=%s | lon=%s",
             reading.victim_id,
             reading.distance_cm,
-            reading.temperature_c or -1,
-            reading.humidity_pct or -1,
-            reading.gas_ppm or -1
+            reading.temperature_c,
+            reading.humidity_pct,
+            reading.gas_ppm,
+            reading.latitude,
+            reading.longitude,
         )
 
         return jsonify({"status": "ok", "reading": reading.to_dict()}), 201
-
-    except KeyError as e:
-        return jsonify({"error": f"Missing field {str(e)}"}), 400
 
     except Exception as e:
         db.session.rollback()
         logger.error("DB insert failed: %s", e)
         return jsonify({"error": "Database error"}), 500
+
+# -----------------------------------------------------
+# ESP control routes
+# -----------------------------------------------------
 @app.route("/send-sos", methods=["POST"])
 def send_sos():
     success = send_esp_command("SOS_ON") if SERIAL_AVAILABLE else False
@@ -470,6 +499,9 @@ def toggle_light():
         "success": success
     }), 200
 
+# -----------------------------------------------------
+# Admin / DB utilities
+# -----------------------------------------------------
 @app.route("/admin/clear-readings", methods=["POST"])
 def clear_readings():
     if not require_key(request):
