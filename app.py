@@ -346,8 +346,10 @@ def home():
         "serial": SERIAL_AVAILABLE,
         "ports": find_esp_ports()
     }), 200
-    
-    @app.route("/admin/reset-db", methods=["POST"])
+
+
+# 🔥 DB RESET ENDPOINT (top-level, NOT inside home)
+@app.route("/admin/reset-db", methods=["POST"])
 def reset_db():
     if not require_key(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -358,6 +360,7 @@ def reset_db():
         return jsonify({"status": "database reset success"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/stream")
 def video_feed():
@@ -373,6 +376,7 @@ def video_feed():
         if not init_camera():
             return jsonify({"error": "No camera detected"}), 503
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 @app.route("/snap")
 def snap():
@@ -394,6 +398,7 @@ def snap():
         return Response(buffer.tobytes(), mimetype="image/jpeg")
     return jsonify({"error": "Capture failed"}), 500
 
+
 @app.route("/api/camera/status")
 def camera_status():
     return jsonify({
@@ -402,6 +407,7 @@ def camera_status():
         "device": 1,
         "resolution": "640x480@15fps (pref)"
     })
+
 
 @app.route("/api/v1/readings", methods=["POST"])
 def create_reading():
@@ -484,6 +490,7 @@ def create_reading():
         logger.error(f"DB error: {e}")
         return jsonify({"error": "Database error"}), 500
 
+
 @app.route("/send-sos", methods=["POST"])
 def send_sos():
     success = send_esp_command("SOS_ON") if SERIAL_AVAILABLE else False
@@ -493,6 +500,7 @@ def send_sos():
         "success": success,
         "message": "Buzzer activated" if success else "ESP32 unavailable"
     }), 200
+
 
 @app.route("/toggle-light", methods=["POST"])
 def toggle_light():
@@ -506,6 +514,7 @@ def toggle_light():
         "success": success
     }), 200
 
+
 @app.route("/admin/clear-readings", methods=["POST"])
 def clear_readings():
     if not require_key(request):
@@ -517,6 +526,7 @@ def clear_readings():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/v1/readings/all", methods=["GET"])
 def all_readings():
@@ -533,6 +543,7 @@ def all_readings():
         "pages": readings.pages
     }), 200
 
+
 @app.route("/api/esp/status", methods=["GET"])
 def esp_status():
     return jsonify({
@@ -541,6 +552,7 @@ def esp_status():
         "port": ESP_PORT,
         "ports": find_esp_ports()
     })
+
 
 @app.route("/admin/init-db", methods=["POST"])
 def admin_init_db():
@@ -552,6 +564,7 @@ def admin_init_db():
     except Exception as e:
         logger.error("init-db failed: %s", e)
         return jsonify({"error": str(e)}), 500
+
 
 @app.route("/admin/clean-duplicates", methods=["POST"])
 def clean_duplicates():
@@ -572,6 +585,7 @@ def clean_duplicates():
         db.session.rollback()
         logger.error("clean-duplicates failed: %s", e)
         return jsonify({"error": "Cleanup failed", "detail": str(e)}), 500
+
 
 @app.route("/api/v1/readings/export/pdf", methods=["GET"])
 def export_readings_pdf():
