@@ -7,6 +7,19 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from io import BytesIO
 
+# Compatibility: ensure pkgutil.get_loader exists (some Python builds remove it)
+import pkgutil
+import importlib.util
+
+if not hasattr(pkgutil, "get_loader"):
+    def _compat_get_loader(name):
+        try:
+            spec = importlib.util.find_spec(name)
+            return spec.loader if spec is not None else None
+        except Exception:
+            return None
+    pkgutil.get_loader = _compat_get_loader
+
 # Try to import reportlab for PDF export (optional)
 try:
     from reportlab.lib.pagesizes import letter
